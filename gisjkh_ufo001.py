@@ -1,21 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-gisjkh-full.py — полный прогон по списку ОГРН из ogrns.txt:
+gisjkh-ufo.py — полный прогон по списку ОГРН из ogrns.txt:
     - вставка ОГРН в Select2 (с fallback и очисткой формы),
     - обработка каждого дома: карточка → ZIP → УФО,
     - 3 скриншота на дом с EXIF,
-    - лог в %TEMP%\\IN\\LOG\\gisjkh-ufo.log,
+    - лог в %TEMP%\\IN\\LOG\\gisjkh-ufo.log (отладочный),
+    - лог %TEMP%\\IN\\LOG\\contracts.log (3 строки на дом),
     - секвенция scrNNNN.jpg в %TEMP%\\IN\\JPG\\.
 
-Правило: обрабатываем дом, только если в архиве ровно 1 PDF + 1 P7S,
-и имя PDF является частью имени P7S. Иначе — NOT_A_CONTRACT, пропуск.
-
-Всё складывается в %TEMP%\\IN\\
-    IN\\IN\\    — распаковка ZIP
-    IN\\OLD\\   — архив обработанных PDF+P7S
-    IN\\JPG\\   — секвенция скриншотов
-    IN\\LOG\\   — лог и sequence.txt
-    IN\\        — временные файлы
+Правило: дом пишется в contracts.log только если одновременно:
+    - ЭП недействительна (marker 'Н' или 'Ж'),
+    - найдена валидная пара PDF+P7S одним из двух способов:
+        * single: ровно 1 PDF + 1 P7S, имена совпадают (как было);
+        * multi:  > 1 PDF, найден договор по маркеру 'договор|ду',
+                  сопоставлено фактическое имя, найдены PDF и P7S.
 """
 
 import os
@@ -62,6 +60,7 @@ UFO_URL = "https://e-trust.gosuslugi.ru/check/sign"
 
 LOG_FILE = LOG_DIR / "gisjkh-ufo.log"
 SEQ_LOG = LOG_DIR / "sequence.txt"
+CONTRACT_LOG = LOG_DIR / "contracts.log"
 
 COPYRIGHT = "Copyright 2026 \u00a9 damiurg by \u043c\u043b\u0445/\u05de\u05dc\u05da Living Private Trust"
 TZ_NAME = "Asia/Omsk"
@@ -71,6 +70,18 @@ WAIT_TIMEOUT = 25
 PAUSE_BETWEEN_PAGES = (2, 4)
 PAUSE_BETWEEN_UK = (5, 10)
 
+# Префикс ЭП оператора ГИС ЖКХ (для single-ветки)
+EP_PREFIX_RE = re.compile(
+    r"^Электронная подпись\s+оператора\s+ГИС\s+ЖКХ\s+\d{2}\.\d{2}\.\d{4}\s+",
+    flags=re.IGNORECASE
+)
+
+# Маркер договора — ищем в заявленных именах
+CONTRACT_RE = re.compile(r"договор|(?<![а-яё])ду(?![а-яё])", re.IGNORECASE)
+
+# Шаблон тултипа фактического имени: '654c605db846b.pdf (6.36 Мб)'
+RE_FACTUAL = re.compile(r"^(.*?)\s*\(\s*\d")
+
 # ============================== PIEXIF ==============================
 try:
     import piexif
@@ -79,7 +90,6 @@ except ImportError:
     _HAS_PIEXIF = False
     print("[!] piexif не установлен. EXIF писаться не будет. "
           "Установи: pip install piexif")
-
 
 # ============================== ЛОГ ==============================
 def log(msg: str):
@@ -93,10 +103,8 @@ def log(msg: str):
     except Exception as e:
         print(f"[!] cannot write log: {e}", flush=True)
 
-
 def log_line(filename_stem: str, date_str: str, result: str):
     log(f"    [result] {filename_stem} | {date_str} | {result}")
-
 
 def log_already_written(filename_stem: str) -> bool:
     if not LOG_FILE.exists():
@@ -110,6 +118,61 @@ def log_already_written(filename_stem: str) -> bool:
         pass
     return False
 
+# ============================== НОВЫЙ ЛОГ ==============================
+def _normalize_org(raw: str) -> str:
+    if not raw:
+        return ""
+    s = raw.strip()
+    s = re.sub(r"ОБЩЕСТВО\s+С\s+ОГРАНИЧЕННОЙ\s+ОТВЕТСТВЕННОСТЬЮ",
+               "ООО", s, flags=re.IGNORECASE)
+    s = re.sub(r"УПРАВЛЯЮЩАЯ\s+КОМПАНИЯ",
+               "УК", s, flags=re.IGNORECASE)
+    return s.strip()
+
+def contract_log_written(org: str, date_str: str, pdf_name: str) -> bool:
+    if not CONTRACT_LOG.exists():
+        return False
+    if not (org and date_str and pdf_name):
+        return False
+    try:
+        with open(CONTRACT_LOG, "r", encoding="utf-8") as fh:
+            for line in fh:
+                if (org in line) and (date_str in line) and (pdf_name in line):
+                    esc_pdf = re.escape(pdf_name)
+                    esc_date = re.escape(date_str)
+                    esc_org = re.escape(org)
+                    pattern = (
+                        r"^-?\s*"
+                        r"scr\d{4}\.jpg\s*-\s*"
+                        + esc_org +
+                        r"\s*--\s*.+?\s*---\s*"
+                        + esc_pdf +
+                        r"\s*----\s*"
+                        + esc_date +
+                        r"\s*$"
+                    )
+                    if re.match(pattern, line.strip()):
+                        return True
+    except Exception:
+        pass
+    return False
+
+def write_contract_log(scr_a: str, scr_b: str, scr_c: str,
+                       org: str, addr: str, pdf_name: str, date_str: str,
+                       ep_name: str, marker: str):
+    line1 = f"{scr_a} - {org} -- {addr} --- {pdf_name} ---- {date_str}"
+    line2 = f"{scr_b} - {pdf_name} -- {ep_name}"
+    line3 = f"{scr_c} - {marker}"
+    try:
+        CONTRACT_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(CONTRACT_LOG, "a", encoding="utf-8", newline="") as fh:
+            fh.write(line1 + "\r\n")
+            fh.write(line2 + "\r\n")
+            fh.write(line3 + "\r\n")
+            fh.write("\r\n")
+        log(f"    [contract-log] written: {line3}")
+    except Exception as e:
+        print(f"[!] cannot write contract log: {e}", flush=True)
 
 # ============================== СЕКВЕНЦИЯ ==============================
 def _next_seq_number() -> int:
@@ -126,7 +189,6 @@ def _next_seq_number() -> int:
         pass
     return maxn + 1
 
-
 def _register_seq(scr_name: str, file_stem: str, tag: str):
     try:
         with open(SEQ_LOG, "a", encoding="utf-8") as fh:
@@ -134,8 +196,7 @@ def _register_seq(scr_name: str, file_stem: str, tag: str):
     except Exception as e:
         print(f"[!] cannot write sequence log: {e}")
 
-
-# ============================== SNAPSHOT + EXIF ==============================
+# ============================== SNAPSHOT ==============================
 def snapshot(driver, tag: str, file_stem: str, extra: str = ""):
     try:
         n = _next_seq_number()
@@ -146,7 +207,7 @@ def snapshot(driver, tag: str, file_stem: str, extra: str = ""):
         ok = driver.save_screenshot(str(tmp_png))
         if not ok:
             print("[!] save_screenshot returned False")
-            return
+            return None
 
         exif_bytes = None
         if _HAS_PIEXIF:
@@ -192,11 +253,12 @@ def snapshot(driver, tag: str, file_stem: str, extra: str = ""):
 
         _register_seq(scr_name, file_stem, tag)
         log(f"    [snap] {scr_name} ({file_stem}_{tag})")
+        return scr_name
     except Exception as e:
         print(f"[!] snapshot failed: {e}")
+        return None
 
-
-# ============================== ТАЙМСТАМП-ОВЕРЛЕЙ ==============================
+# ============================== ОВЕРЛЕЙ ==============================
 _TS_JS = r"""
 (function() {
     var hostId = '__ts_host__';
@@ -247,13 +309,11 @@ _TS_JS = r"""
 })();
 """
 
-
 def inject_timestamp_overlay(driver):
     try:
         driver.execute_script(_TS_JS)
     except Exception as e:
         print("[!] overlay:", e)
-
 
 def set_ufo_zoom(driver):
     try:
@@ -261,8 +321,7 @@ def set_ufo_zoom(driver):
     except Exception:
         pass
 
-
-# ============================== ВСПОМОГАТЕЛЬНОЕ (из test.py) ==============================
+# ============================== ВСПОМОГАТЕЛЬНОЕ ==============================
 def read_ogrns(path: Path) -> list:
     if not path.exists():
         raise FileNotFoundError(f"no {path}")
@@ -277,7 +336,6 @@ def read_ogrns(path: Path) -> list:
         out.append(s)
     return out
 
-
 def read_selected_text(driver) -> str:
     for sel in ("span.select2-chosen",
                 ".select2-selection__rendered",
@@ -290,7 +348,6 @@ def read_selected_text(driver) -> str:
             pass
     return ""
 
-
 def read_input_value(driver) -> str:
     try:
         els = driver.find_elements(By.CSS_SELECTOR, "input.select2-input")
@@ -299,7 +356,6 @@ def read_input_value(driver) -> str:
     except Exception:
         pass
     return ""
-
 
 def drop_select2_mask(driver):
     try:
@@ -310,7 +366,6 @@ def drop_select2_mask(driver):
         """)
     except Exception:
         pass
-
 
 def click_diagonal_cross(driver) -> str:
     for sel in [
@@ -336,8 +391,6 @@ def click_diagonal_cross(driver) -> str:
             return f"error:{sel}:{e}"
     return "not_found"
 
-
-# ============================== ВСПОМОГАТЕЛЬНОЕ (из snapshot) ==============================
 def clean_dir_files(directory: Path):
     if not directory.exists():
         return
@@ -348,8 +401,7 @@ def clean_dir_files(directory: Path):
             except Exception:
                 pass
 
-
-def wait_file(directory: Path, pattern: str, timeout: int = 30):
+def wait_file(directory: Path, pattern: str, timeout: int = 60):
     end = time.time() + timeout
     last_size = -1
     while time.time() < end:
@@ -362,7 +414,6 @@ def wait_file(directory: Path, pattern: str, timeout: int = 30):
             last_size = size
         time.sleep(1)
     return None
-
 
 def extract_zip(zip_path: Path, out_dir: Path) -> bool:
     if zip_path is None or not zip_path.exists():
@@ -379,29 +430,64 @@ def extract_zip(zip_path: Path, out_dir: Path) -> bool:
         time.sleep(2)
     return False
 
-
-def find_pdf_p7s_pair(directory: Path):
-    """
-    Жёсткое правило:
-      - в архиве ровно 1 PDF и ровно 1 P7S;
-      - имя PDF является частью имени P7S.
-    Иначе — пустой список (NOT_A_CONTRACT).
-    """
+# ============================== ПАРЫ PDF+P7S ==============================
+def find_pdf_p7s_pair_single(directory: Path):
+    """Старая логика: ровно 1 PDF + 1 P7S, имена совпадают."""
     pdfs = [f for f in directory.iterdir() if f.suffix.lower() == ".pdf"]
     p7s_list = [f for f in directory.iterdir()
-                if f.suffix.lower() in (".p7s", ".sig", ".sgn")]
+                if f.suffix.lower() in (".p7s", ".sig")]
 
     if len(pdfs) != 1 or len(p7s_list) != 1:
         return []
 
     pdf = pdfs[0]
     p7s = p7s_list[0]
+    p7s_stem = p7s.stem
 
-    if pdf.name not in p7s.name:
+    if EP_PREFIX_RE.match(p7s_stem):
+        clean = EP_PREFIX_RE.sub("", p7s_stem)
+        clean_base = re.sub(r"\.pdf$", "", clean, flags=re.IGNORECASE)
+        if clean_base == pdf.stem:
+            return [(pdf, p7s)]
+        log(f"    [pair-single] strict mismatch: pdf='{pdf.stem}' "
+            f"vs clean_p7s='{clean_base}'")
+        return []
+    else:
+        if pdf.name in p7s.name:
+            log(f"    [pair-single] soft match: pdf='{pdf.name}'")
+            return [(pdf, p7s)]
         return []
 
-    return [(pdf, p7s)]
+def find_pdf_p7s_pair_multi(directory: Path, actual_pdf_name: str):
+    """
+    Новая логика для мультиархивов:
+      - фактический PDF ищем по имени actual_pdf_name;
+      - P7S — по маске '*{actual_pdf_name}.p7s' / '.sig'.
+    """
+    pdf_path = None
+    p7s_found = []
+    try:
+        for f in directory.iterdir():
+            if not f.is_file():
+                continue
+            if f.name == actual_pdf_name:
+                pdf_path = f
+                continue
+            lowname = f.name.lower()
+            if lowname.endswith(".p7s") or lowname.endswith(".sig"):
+                for ext in (".p7s", ".sig"):
+                    if f.name.endswith(f"{actual_pdf_name}{ext}"):
+                        p7s_found.append(f)
+                        break
+    except Exception as e:
+        log(f"    [pair-multi] обход архива упал: {e}")
+        return [], None
 
+    if pdf_path is None:
+        return [], None
+    if len(p7s_found) != 1:
+        return [], pdf_path
+    return [(pdf_path, p7s_found[0])], pdf_path
 
 def move_to_old(files):
     for f in files:
@@ -417,15 +503,26 @@ def move_to_old(files):
             except PermissionError:
                 time.sleep(1)
 
-
-def close_tabs_except(driver, keep_handles: list):
-    for h in driver.window_handles:
+def close_tabs_except(driver, keep_handles):
+    if not hasattr(driver, "window_handles"):
+        print(f"[!] close_tabs_except: driver is not a webdriver, "
+              f"got {type(driver).__name__}: {driver!r}", flush=True)
+        return
+    for h in list(driver.window_handles):
         if h not in keep_handles:
-            driver.switch_to.window(h)
-            driver.close()
-
+            try:
+                driver.switch_to.window(h)
+                driver.close()
+            except Exception as e:
+                print(f"[!] close_tabs_except: cannot close {h}: {e}",
+                      flush=True)
 
 def open_new_tab_and_switch(driver, wait, click_fn):
+    if not hasattr(driver, "window_handles"):
+        raise RuntimeError(
+            f"open_new_tab_and_switch: driver is not a webdriver, "
+            f"got {type(driver).__name__}: {driver!r}"
+        )
     handles_before = set(driver.window_handles)
     click_fn()
     wait.until(lambda d: len(set(d.window_handles) - handles_before) > 0)
@@ -435,7 +532,6 @@ def open_new_tab_and_switch(driver, wait, click_fn):
     inject_timestamp_overlay(driver)
     return new_handle
 
-
 # ============================== ГИС ЖКХ ==============================
 def open_uk_tab(driver, wait: WebDriverWait):
     tab = wait.until(EC.element_to_be_clickable(
@@ -443,7 +539,6 @@ def open_uk_tab(driver, wait: WebDriverWait):
     ))
     tab.click()
     time.sleep(2)
-
 
 def select_org(driver, wait: WebDriverWait, ogrn: str) -> bool:
     drop_select2_mask(driver)
@@ -503,7 +598,6 @@ def select_org(driver, wait: WebDriverWait, ogrn: str) -> bool:
         log(f"    no house cards appeared for {ogrn}")
         return False
 
-
 def set_page_size_100(driver, wait: WebDriverWait) -> bool:
     try:
         select_el = wait.until(EC.presence_of_element_located(
@@ -515,7 +609,6 @@ def set_page_size_100(driver, wait: WebDriverWait) -> bool:
     except Exception as e:
         log(f"    cannot set page size 100: {e}")
         return False
-
 
 def read_contract_date(driver):
     label_text = "Дата заключения договора управления"
@@ -546,9 +639,269 @@ def read_contract_date(driver):
         pass
     return "unknown"
 
+# ============================== СБОР ПОЛЕЙ С ГИС ЖКХ ==============================
+def count_pdf_icons(driver) -> int:
+    """Считает иконки PDF на странице МКД."""
+    try:
+        els = driver.find_elements(
+            By.CSS_SELECTOR,
+            "span.form-upload__icon.icon-file.icon-file_pdf"
+        )
+        return len(els)
+    except Exception:
+        return -1
+
+def collect_pdf_pairs(driver) -> list:
+    """
+    Собирает пары (заявленное, фактическое) со страницы МКД.
+    Возвращает список кортежей, порядок — как на странице.
+    """
+    pairs = []
+    try:
+        rows = driver.find_elements(
+            By.CSS_SELECTOR,
+            "div.file-panel__row.file-panel__justify-start"
+        )
+    except Exception:
+        return pairs
+
+    for row in rows:
+        try:
+            if not row.find_elements(By.CSS_SELECTOR, "span.icon-file_pdf"):
+                continue
+        except Exception:
+            continue
+
+        declared = ""
+        try:
+            candidates = row.find_elements(
+                By.CSS_SELECTOR,
+                ".file-panel__row-item.file-panel__name span.ng-binding"
+            )
+            for el in candidates:
+                try:
+                    style = (el.get_attribute("style") or "").lower()
+                    text = (el.text or "").strip()
+                except Exception:
+                    continue
+                if "0075c0" in style and text:
+                    declared = text
+                    break
+            if not declared:
+                for el in candidates:
+                    try:
+                        text = (el.text or "").strip()
+                    except Exception:
+                        text = ""
+                    if text and text != "Документ PDF":
+                        declared = text
+                        break
+        except Exception:
+            pass
+
+        actual = ""
+        try:
+            tooltips = row.find_elements(
+                By.CSS_SELECTOR,
+                "span.soh__content.common-tooltip__content.ng-binding"
+            )
+            for t in tooltips:
+                try:
+                    txt = (t.get_attribute("textContent") or "").strip()
+                except Exception:
+                    txt = ""
+                if not txt:
+                    continue
+                m = RE_FACTUAL.match(txt)
+                if m:
+                    actual = m.group(1).strip()
+                    break
+        except Exception:
+            pass
+
+        pairs.append((declared, actual))
+    return pairs
+
+def find_contract_actual_name(pairs: list):
+    """
+    Возвращает фактическое имя PDF-договора, если найден РОВНО один
+    по маркеру 'договор'/'ду' в заявленном имени, и у него есть
+    непустое фактическое. Иначе — ''.
+    """
+    hits = [(d, a) for (d, a) in pairs if d and CONTRACT_RE.search(d)]
+    if not hits:
+        log(f"    [multi] маркер 'договор|ду' не найден среди {len(pairs)} пар")
+        return ""
+    if len(hits) > 1:
+        log(f"    [multi] маркер найден в {len(hits)} парах — мультиархив")
+        for d, a in hits:
+            log(f"      - {d!r} -> {a!r}")
+        return ""
+    d, a = hits[0]
+    if not a:
+        log(f"    [multi] договор найден ({d!r}), но фактическое имя пусто")
+        return ""
+    log(f"    [multi] договор: {d!r} -> actual={a!r}")
+    return a
+
+def collect_house_info(driver):
+    info = {"org": "", "addr": "", "pdf_name": "", "date": "",
+            "pdf_icons": -1, "pairs": []}
+
+    try:
+        els = driver.find_elements(By.CSS_SELECTOR, "a.ctrl-link.ng-binding")
+        for el in els:
+            txt = (el.text or "").strip()
+            if txt:
+                info["org"] = _normalize_org(txt)
+                break
+    except Exception:
+        pass
+    if not info["org"]:
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text
+            m = re.search(r"Наименование организации[^\n]{0,5}\n([^\n]+)", body)
+            if m:
+                info["org"] = _normalize_org(m.group(1).strip())
+        except Exception:
+            pass
+
+    try:
+        els = driver.find_elements(
+            By.CSS_SELECTOR,
+            "span.form-base__form-value.ng-binding[ng-bind='addressInfo.formattedAddress']"
+        )
+        if not els:
+            els = driver.find_elements(
+                By.CSS_SELECTOR,
+                "span.form-base__form-value.ng-binding"
+            )
+        for el in els:
+            txt = (el.text or "").strip()
+            if re.search(r"\d{6},", txt):
+                info["addr"] = txt
+                break
+    except Exception:
+        pass
+    if not info["addr"]:
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text
+            m = re.search(r"Адрес дома[^\n]{0,5}\n([^\n]+)", body)
+            if m:
+                info["addr"] = m.group(1).strip()
+        except Exception:
+            pass
+
+    try:
+        els = driver.find_elements(
+            By.CSS_SELECTOR,
+            ".file-panel_row-item_file-panel_name .ng-binding"
+        )
+        for el in els:
+            title = el.get_attribute("title") or ""
+            txt = (el.text or "").strip()
+            candidate = title or txt
+            if candidate.lower().endswith(".pdf"):
+                info["pdf_name"] = candidate
+                break
+    except Exception:
+        pass
+
+    info["date"] = read_contract_date(driver)
+    if info["date"] == "unknown":
+        info["date"] = ""
+
+    # --- NEW: иконки и пары ---
+    info["pdf_icons"] = count_pdf_icons(driver)
+    if info["pdf_icons"] > 1:
+        info["pairs"] = collect_pdf_pairs(driver)
+
+    return info
+
+# ============================== СБОР ПОЛЕЙ С УФО ==============================
+def collect_ep_name(driver) -> str:
+    try:
+        els = driver.find_elements(
+            By.CSS_SELECTOR,
+            "div.text-overflow-text-plain.ng-binding"
+        )
+        for el in els:
+            txt = (el.text or "").strip()
+            low = txt.lower()
+            if low.endswith(".p7s") or low.endswith(".sig"):
+                return txt
+    except Exception:
+        pass
+    try:
+        body = driver.find_element(By.TAG_NAME, "body").text
+        for m in re.finditer(r"[^\n]+\.(?:p7s|sig)", body, flags=re.IGNORECASE):
+            line = m.group(0).strip()
+            if "Электронная подпись" in line or "подпись" in line.lower():
+                return line
+        m = re.search(r"[^\n]+\.(?:p7s|sig)", body, flags=re.IGNORECASE)
+        if m:
+            return m.group(0).strip()
+    except Exception:
+        pass
+    return ""
+
+def collect_result_marker(driver):
+    result_text = ""
+    second_confirmed = False
+
+    try:
+        els = driver.find_elements(By.CSS_SELECTOR, "h2.title-h2")
+        for el in els:
+            txt = (el.text or "").strip()
+            m = re.search(r"Подпись\s+([А-ЯЁ]+)", txt)
+            if m:
+                result_text = m.group(1).strip()
+                break
+    except Exception:
+        pass
+    if not result_text:
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text
+            m = re.search(r"Подпись\s+([А-ЯЁ]+)", body)
+            if m:
+                result_text = m.group(1).strip()
+        except Exception:
+            pass
+
+    try:
+        els = driver.find_elements(By.CSS_SELECTOR, "p.text-plain_bold")
+        for el in els:
+            txt = (el.text or "").strip().lower()
+            if "электронная подпись недействительна" in txt:
+                second_confirmed = True
+                break
+    except Exception:
+        pass
+    if not second_confirmed:
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text.lower()
+            if "электронная подпись недействительна" in body:
+                second_confirmed = True
+        except Exception:
+            pass
+
+    if result_text == "НЕДЕЙСТВИТЕЛЬНА":
+        marker = "Ж" if second_confirmed else "Н"
+    else:
+        marker = None
+
+    return result_text, marker
 
 # ============================== ОСНОВНОЙ ЦИКЛ ==============================
 def process_one_house(driver, ufo_handle, gis_handle, index):
+    print(f"[dbg] process_one_house: driver={type(driver).__name__} "
+          f"id={id(driver)} index={index}", flush=True)
+    if not hasattr(driver, "window_handles"):
+        raise RuntimeError(
+            f"process_one_house: driver is not a webdriver, "
+            f"got {type(driver).__name__}: {driver!r}"
+        )
+
     wait = WebDriverWait(driver, 25)
     driver.switch_to.window(gis_handle)
     inject_timestamp_overlay(driver)
@@ -584,18 +937,61 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     # --- ПРАВКА 1: задержка 2 сек перед скриншотом 01_mkd ---
     time.sleep(2)
 
-    download_btn = wait.until(EC.element_to_be_clickable(
-        (By.CSS_SELECTOR, "button[class*='downloadAllFiles']")
-    ))
+    download_btn = None
+    try:
+        download_btn = WebDriverWait(driver, 5).until(
+            EC.element_to_be_clickable(
+                (By.CSS_SELECTOR, "button[class*='downloadAllFiles']")
+            )
+        )
+    except TimeoutException:
+        log("    кнопка скачивания не появилась — документов нет")
 
-    snapshot(driver, "01_mkd", "pending",
-             f"МКД, дата ДУ(У)={contract_date}")
+    house_info = collect_house_info(driver)
+    log(f"    house_info: org={house_info['org']!r} "
+        f"addr={house_info['addr']!r} "
+        f"pdf={house_info['pdf_name']!r} "
+        f"date={house_info['date']!r} "
+        f"pdf_icons={house_info['pdf_icons']}")
+
+    scr_mkd = snapshot(driver, "01_mkd", "pending",
+                       f"МКД, дата ДУ(У)={contract_date}")
     time.sleep(0.5)
 
+    # --- Проверка 0 иконок → дом пропускаем ---
+    if house_info["pdf_icons"] == 0:
+        log("    pdf_icons=0 — документов нет, дом пропускаем")
+        close_tabs_except(driver, [ufo_handle, gis_handle])
+        driver.switch_to.window(gis_handle)
+        inject_timestamp_overlay(driver)
+        log_line("NO_DOCUMENTS", contract_date, "-")
+        return True
+
+    if download_btn is None:
+        close_tabs_except(driver, [ufo_handle, gis_handle])
+        driver.switch_to.window(gis_handle)
+        inject_timestamp_overlay(driver)
+        log_line("NO_DOWNLOAD_BTN", contract_date, "-")
+        return True
+
+    # --- Мультиархив: заранее определяем фактическое имя договора ---
+    actual_pdf_name = ""
+    if house_info["pdf_icons"] > 1:
+        actual_pdf_name = find_contract_actual_name(house_info["pairs"])
+        if not actual_pdf_name:
+            log("    pdf_icons>1, но договор не определён однозначно — пропуск")
+            close_tabs_except(driver, [ufo_handle, gis_handle])
+            driver.switch_to.window(gis_handle)
+            inject_timestamp_overlay(driver)
+            log_line("MULTI_CONTRACT", contract_date, "-")
+            return True
+        log(f"    multi: ожидаем PDF '{actual_pdf_name}'")
+
+    # --- Скачивание ZIP ---
     driver.execute_script("arguments[0].click();", download_btn)
     time.sleep(3)
 
-    zip_file = wait_file(DOWNLOADS, r"Документы из ГИС ЖКХ.*\.zip", timeout=30)
+    zip_file = wait_file(DOWNLOADS, r"Документы из ГИС ЖКХ.*\.zip", timeout=60)
     if zip_file is None:
         log("    ZIP не скачался")
         close_tabs_except(driver, [ufo_handle, gis_handle])
@@ -620,18 +1016,44 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     inject_timestamp_overlay(driver)
     set_ufo_zoom(driver)
 
-    pairs = find_pdf_p7s_pair(IN_DIR)
-    if not pairs:
-        log("    NOT_A_CONTRACT: в архиве не 1 PDF + 1 P7S, пропускаем дом")
-        move_to_old([zip_file])
-        clean_dir_files(IN_DIR)
-        close_tabs_except(driver, [ufo_handle, gis_handle])
-        driver.switch_to.window(gis_handle)
-        inject_timestamp_overlay(driver)
-        log_line("NOT_A_CONTRACT", contract_date, "-")
-        return True
+    # --- Выбор пары: single или multi ---
+    pdf = None
+    p7s = None
+    if house_info["pdf_icons"] > 1:
+        pairs, pdf_path = find_pdf_p7s_pair_multi(IN_DIR, actual_pdf_name)
+        if pdf_path is None:
+            log("    [multi] PDF с фактическим именем не найден — пропуск")
+            move_to_old([zip_file])
+            clean_dir_files(IN_DIR)
+            close_tabs_except(driver, [ufo_handle, gis_handle])
+            driver.switch_to.window(gis_handle)
+            inject_timestamp_overlay(driver)
+            log_line("NO_PDF_IN_ARCHIVE", contract_date, "-")
+            return True
+        if not pairs:
+            log("    [multi] P7S не найден или их больше одного — пропуск")
+            move_to_old([zip_file])
+            clean_dir_files(IN_DIR)
+            close_tabs_except(driver, [ufo_handle, gis_handle])
+            driver.switch_to.window(gis_handle)
+            inject_timestamp_overlay(driver)
+            log_line("NO_OR_MULTI_P7S", contract_date, "-")
+            return True
+        pdf, p7s = pairs[0]
+        log(f"    [multi] пара: {pdf.name} + {p7s.name}")
+    else:
+        pairs = find_pdf_p7s_pair_single(IN_DIR)
+        if not pairs:
+            log("    [single] NOT_A_CONTRACT: не 1 PDF + 1 P7S или имена не совпали")
+            move_to_old([zip_file])
+            clean_dir_files(IN_DIR)
+            close_tabs_except(driver, [ufo_handle, gis_handle])
+            driver.switch_to.window(gis_handle)
+            inject_timestamp_overlay(driver)
+            log_line("NOT_A_CONTRACT", contract_date, "-")
+            return True
+        pdf, p7s = pairs[0]
 
-    pdf, p7s = pairs[0]
     file_stem = pdf.stem
 
     try:
@@ -656,8 +1078,11 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     p7s_input.send_keys(str(p7s))
     time.sleep(3)
 
-    snapshot(driver, "02_ufo_loaded", file_stem,
-             f"{file_stem} | ДУ(У)={contract_date}")
+    ep_name = collect_ep_name(driver)
+    log(f"    ep_name: {ep_name!r}")
+
+    scr_ufo_loaded = snapshot(driver, "02_ufo_loaded", file_stem,
+                              f"{file_stem} | ДУ(У)={contract_date}")
     time.sleep(0.5)
 
     check_btn = wait.until(EC.element_to_be_clickable(
@@ -666,6 +1091,10 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     check_btn.click()
 
     result_sign = "-"
+    marker = None
+    scr_ufo_result = None
+    result_text = ""
+
     try:
         wait.until(EC.presence_of_element_located(
             (By.XPATH,
@@ -674,13 +1103,50 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
         ))
         time.sleep(2)
 
-        snapshot(driver, "03_ufo_result", file_stem,
-                 f"{file_stem} | ДУ(У)={contract_date} | результат={result_sign}")
+        result_text, marker = collect_result_marker(driver)
+        log(f"    result_text: {result_text!r}  marker: {marker!r}")
+
+        scr_ufo_result = snapshot(
+            driver, "03_ufo_result", file_stem,
+            f"{file_stem} | ДУ(У)={contract_date} | результат={result_text}"
+        )
         time.sleep(0.5)
 
-        result_sign = "+"
+        if result_text == "ДЕЙСТВИТЕЛЬНА":
+            result_sign = "+"
+        elif result_text == "НЕДЕЙСТВИТЕЛЬНА":
+            result_sign = "-"
     except Exception:
-        result_sign = "-"
+        result_text = ""
+        marker = None
+
+    # --- Запись в новый лог ---
+    try:
+        if (marker in ("Ж", "Н")
+                and scr_mkd and scr_ufo_loaded and scr_ufo_result
+                and house_info["org"]
+                and house_info["addr"]
+                and house_info["pdf_name"]
+                and house_info["date"]
+                and ep_name):
+            if contract_log_written(house_info["org"],
+                                    house_info["date"],
+                                    house_info["pdf_name"]):
+                log("    [contract-log] already written, skip")
+            else:
+                write_contract_log(
+                    scr_mkd, scr_ufo_loaded, scr_ufo_result,
+                    house_info["org"],
+                    house_info["addr"],
+                    house_info["pdf_name"],
+                    house_info["date"],
+                    ep_name,
+                    marker,
+                )
+        else:
+            log("    [contract-log] conditions not met, skip")
+    except Exception as e:
+        log(f"    [contract-log] error: {e}")
 
     try:
         back_link = WebDriverWait(driver, 5).until(EC.element_to_be_clickable(
@@ -718,7 +1184,6 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
 
     return True
 
-
 def next_page(driver, gis_handle) -> bool:
     driver.switch_to.window(gis_handle)
     try:
@@ -732,10 +1197,8 @@ def next_page(driver, gis_handle) -> bool:
     except Exception:
         return False
 
-
 # ============================== MAIN ==============================
 def build_driver() -> webdriver.Chrome:
-    """Дефолтный Chrome, без binary_location."""
     options = webdriver.ChromeOptions()
     prefs = {
         "download.default_directory": str(DOWNLOADS),
@@ -747,7 +1210,6 @@ def build_driver() -> webdriver.Chrome:
     driver = webdriver.Chrome(options=options)
     driver.maximize_window()
     return driver
-
 
 def main():
     ogrns = read_ogrns(OGRN_FILE)
@@ -858,7 +1320,6 @@ def main():
 
     log(f"=== END === ok_uk={ok_uk} not_found_uk={nf_uk} "
         f"errors_uk={err_uk} TOTAL_MKD={total_mkd}")
-
 
 if __name__ == "__main__":
     main()
