@@ -795,7 +795,7 @@ def collect_house_info(driver):
     try:
         els = driver.find_elements(
             By.CSS_SELECTOR,
-            ".file-panel_row-item_file-panel_name .ng-binding"
+            ".file-panel__row-item.file-panel__name .ng-binding"
         )
         for el in els:
             title = el.get_attribute("title") or ""
@@ -811,10 +811,29 @@ def collect_house_info(driver):
     if info["date"] == "unknown":
         info["date"] = ""
 
-    # --- NEW: иконки и пары ---
+    # --- иконки и пары ---
     info["pdf_icons"] = count_pdf_icons(driver)
     if info["pdf_icons"] > 1:
         info["pairs"] = collect_pdf_pairs(driver)
+
+    # --- для мультиархива: заявленное имя договора берём из пар ---
+    if info["pdf_icons"] > 1 and info["pairs"]:
+        hits = [(d, a) for (d, a) in info["pairs"]
+                if d and CONTRACT_RE.search(d)]
+        if len(hits) == 1:
+            info["pdf_name"] = hits[0][0]
+            log(f"    [house] pdf_name из пары: {info['pdf_name']!r}")
+
+    # --- fallback: если всё ещё пусто — ищем .pdf в body ---
+    if not info["pdf_name"]:
+        try:
+            body = driver.find_element(By.TAG_NAME, "body").text
+            # ищем имя файла с расширением .pdf, допуская пробелы внутри
+            m = re.search(r"([^\n\r\\/]{2,200}?\.pdf)", body)
+            if m:
+                info["pdf_name"] = m.group(1).strip()
+        except Exception:
+            pass
 
     return info
 
