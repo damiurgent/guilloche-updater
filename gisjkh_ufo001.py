@@ -1,19 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-gisjkh-ufo.py — полный прогон по списку ОГРН из ogrns.txt:
-    - вставка ОГРН в Select2 (с fallback и очисткой формы),
-    - обработка каждого дома: карточка → ZIP → УФО,
-    - 3 скриншота на дом с EXIF,
-    - лог в %TEMP%\\IN\\LOG\\gisjkh-ufo.log (отладочный),
-    - лог %TEMP%\\IN\\LOG\\contracts.log (3 строки на дом),
-    - секвенция scrNNNN.jpg в %TEMP%\\IN\\JPG\\.
+gisjkh-ufo.py — полный прогон по списку ОГРН из ogrns.txt.
 
 Правило: дом пишется в contracts.log только если одновременно:
     - ЭП недействительна (marker 'Н' или 'Ж'),
-    - найдена валидная пара PDF+P7S одним из двух способов:
-        * single: ровно 1 PDF + 1 P7S, имена совпадают (как было);
+    - найдена валидная пара PDF+P7S одним из способов:
+        * single: ровно 1 PDF + 1 P7S, имена совпадают;
         * multi:  > 1 PDF, найден договор по маркеру 'договор|ду',
-                  сопоставлено фактическое имя, найдены PDF и P7S.
+                  при нескольких кандидатах отсеиваются допы
+                  (по маркерам 'к ду' / 'к договор'); должен остаться ровно 1;
+        * fallback: кнопки 'Скачать все' нет — качаем PDF и P7S по отдельности.
 """
 
 import os
@@ -34,8 +30,10 @@ from selenium.common.exceptions import (
     ElementNotInteractableException,
     ElementClickInterceptedException,
     StaleElementReferenceException,
+    WebDriverException,
 )
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -70,17 +68,22 @@ WAIT_TIMEOUT = 25
 PAUSE_BETWEEN_PAGES = (2, 4)
 PAUSE_BETWEEN_UK = (5, 10)
 
-# Префикс ЭП оператора ГИС ЖКХ (для single-ветки)
 EP_PREFIX_RE = re.compile(
     r"^Электронная подпись\s+оператора\s+ГИС\s+ЖКХ\s+\d{2}\.\d{2}\.\d{4}\s+",
     flags=re.IGNORECASE
 )
 
-# Маркер договора — ищем в заявленных именах
 CONTRACT_RE = re.compile(r"договор|(?<![а-яё])ду(?![а-яё])", re.IGNORECASE)
 
-# Шаблон тултипа фактического имени: '654c605db846b.pdf (6.36 Мб)'
+# Маркер «это доп. соглашение, а не основной договор»
+ADDENDUM_RE = re.compile(r"к\s*ду|к\s*договор", re.IGNORECASE)
+
 RE_FACTUAL = re.compile(r"^(.*?)\s*\(\s*\d")
+
+# --- Параметры «последней надежды» (пофайловое скачивание) ---
+FB_WAIT_RENDER = 5        # ожидание отрисовки страницы МКД
+FB_WAIT_AFTER_CLICK = 7   # пауза после клика (ЭП, PDF)
+FB_PDF_MARKERS = ("договор", "ду")  # маркеры для отбора PDF по имени
 
 # ============================== PIEXIF ==============================
 try:
@@ -125,34 +128,46 @@ def _normalize_org(raw: str) -> str:
     s = raw.strip()
     s = re.sub(r"ОБЩЕСТВО\s+С\s+ОГРАНИЧЕННОЙ\s+ОТВЕТСТВЕННОСТЬЮ",
                "ООО", s, flags=re.IGNORECASE)
+    s = re.sub(r"АКЦИОНЕРНОЕ\s+ОБЩЕСТВО",
+               "АО", s, flags=re.IGNORECASE)
     s = re.sub(r"УПРАВЛЯЮЩАЯ\s+КОМПАНИЯ",
                "УК", s, flags=re.IGNORECASE)
+    s = re.sub(r"ЖИЛИЩНО-ЭКСПЛУАТАЦИОННОЕ\s+УПРАВЛЕНИЕ",
+               "ЖЭУ", s, flags=re.IGNORECASE)
+    s = re.sub(r"ЖИЛИЩНО-КОММУНАЛЬНОЕ\s+ХОЗЯЙСТВО",
+               "ЖКХ", s, flags=re.IGNORECASE)
     return s.strip()
 
-def contract_log_written(org: str, date_str: str, pdf_name: str) -> bool:
+def contract_log_written(org: str, date_str: str,
+                         pdf_name: str, addr: str) -> bool:
     if not CONTRACT_LOG.exists():
         return False
-    if not (org and date_str and pdf_name):
+    if not (org and date_str and pdf_name and addr):
         return False
     try:
         with open(CONTRACT_LOG, "r", encoding="utf-8") as fh:
             for line in fh:
-                if (org in line) and (date_str in line) and (pdf_name in line):
-                    esc_pdf = re.escape(pdf_name)
-                    esc_date = re.escape(date_str)
-                    esc_org = re.escape(org)
-                    pattern = (
-                        r"^-?\s*"
-                        r"scr\d{4}\.jpg\s*-\s*"
-                        + esc_org +
-                        r"\s*--\s*.+?\s*---\s*"
-                        + esc_pdf +
-                        r"\s*----\s*"
-                        + esc_date +
-                        r"\s*$"
-                    )
-                    if re.match(pattern, line.strip()):
-                        return True
+                if not (org in line and date_str in line
+                        and pdf_name in line and addr in line):
+                    continue
+                esc_pdf = re.escape(pdf_name)
+                esc_date = re.escape(date_str)
+                esc_org = re.escape(org)
+                esc_addr = re.escape(addr)
+                pattern = (
+                    r"^-?\s*"
+                    r"scr\d{4}\.jpg\s*-\s*"
+                    + esc_org +
+                    r"\s*--\s*"
+                    + esc_addr +
+                    r"\s*---\s*"
+                    + esc_pdf +
+                    r"\s*----\s*"
+                    + esc_date +
+                    r"\s*$"
+                )
+                if re.match(pattern, line.strip()):
+                    return True
     except Exception:
         pass
     return False
@@ -432,7 +447,6 @@ def extract_zip(zip_path: Path, out_dir: Path) -> bool:
 
 # ============================== ПАРЫ PDF+P7S ==============================
 def find_pdf_p7s_pair_single(directory: Path):
-    """Старая логика: ровно 1 PDF + 1 P7S, имена совпадают."""
     pdfs = [f for f in directory.iterdir() if f.suffix.lower() == ".pdf"]
     p7s_list = [f for f in directory.iterdir()
                 if f.suffix.lower() in (".p7s", ".sig")]
@@ -459,11 +473,6 @@ def find_pdf_p7s_pair_single(directory: Path):
         return []
 
 def find_pdf_p7s_pair_multi(directory: Path, actual_pdf_name: str):
-    """
-    Новая логика для мультиархивов:
-      - фактический PDF ищем по имени actual_pdf_name;
-      - P7S — по маске '*{actual_pdf_name}.p7s' / '.sig'.
-    """
     pdf_path = None
     p7s_found = []
     try:
@@ -531,6 +540,146 @@ def open_new_tab_and_switch(driver, wait, click_fn):
     time.sleep(2)
     inject_timestamp_overlay(driver)
     return new_handle
+
+# ============================== ПОСЛЕДНЯЯ НАДЕЖДА ==============================
+def _fb_get_text(el) -> str:
+    try:
+        t = el.get_attribute("textContent")
+        if t is not None:
+            return t.strip()
+    except Exception:
+        pass
+    try:
+        return (el.text or "").strip()
+    except Exception:
+        return ""
+
+def _fb_click_hoverable(driver, el, label: str) -> bool:
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});", el
+        )
+        time.sleep(0.3)
+    except Exception:
+        pass
+
+    try:
+        ActionChains(driver).move_to_element(el).pause(0.4).click(el).perform()
+        log(f"    [fb] {label}: ActionChains-клик выполнен")
+        return True
+    except WebDriverException as e:
+        log(f"    [fb] {label}: ActionChains-клик упал: {e}")
+
+    try:
+        driver.execute_script("arguments[0].click();", el)
+        log(f"    [fb] {label}: JS-клик выполнен")
+        return True
+    except Exception as e:
+        log(f"    [fb] {label}: JS-клик упал: {e}")
+        return False
+
+def download_files_individually(driver, wait) -> list:
+    log("    [fb] === попытка пофайлового скачивания ===")
+    time.sleep(FB_WAIT_RENDER)
+
+    raw_names = driver.find_elements(
+        By.CSS_SELECTOR,
+        "div.file-panel__row-item.file-panel__name span.ng-binding"
+    )
+    log(f"    [fb] найдено span.ng-binding в file-panel__name: {len(raw_names)}")
+
+    name_spans = []
+    for el in raw_names:
+        t = _fb_get_text(el)
+        if not t:
+            continue
+        if not t.lower().endswith(".pdf"):
+            continue
+        if "(" in t:
+            continue
+        name_spans.append(el)
+
+    log(f"    [fb] отобрано имён .pdf (без размера): {len(name_spans)}")
+    for el in name_spans:
+        log(f"        {_fb_get_text(el)!r}")
+
+    relevant = []
+    for el in name_spans:
+        txt = _fb_get_text(el)
+        low = txt.lower()
+        if any(m in low for m in FB_PDF_MARKERS):
+            relevant.append((txt, el))
+
+    log(f"    [fb] PDF по маркерам {FB_PDF_MARKERS}: {len(relevant)}")
+    for name, _ in relevant:
+        log(f"        {name!r}")
+
+    if len(relevant) != 1:
+        log(f"    [fb] ожидалось 1 совпадение, получили {len(relevant)} — стоп")
+        return None
+
+    target_name, target_name_el = relevant[0]
+    log(f"    [fb] ЦЕЛЬ: {target_name!r}")
+
+    pdf_icons = driver.find_elements(By.CSS_SELECTOR, "span.icon-file_pdf")
+    log(f"    [fb] найдено PDF-иконок (span.icon-file_pdf): {len(pdf_icons)}")
+    if len(pdf_icons) != 1:
+        log(f"    [fb] PDF-иконок={len(pdf_icons)} — не могу однозначно сопоставить")
+        return None
+    pdf_icon = pdf_icons[0]
+
+    try:
+        sig_icon = pdf_icon.find_element(
+            By.XPATH,
+            "preceding::span[contains(@class, 'gis-icon-signature')][1]"
+        )
+        log("    [fb] ЭП-иконка найдена через preceding:: от PDF-иконки")
+    except Exception as e:
+        log(f"    [fb] не удалось найти ЭП-иконку перед PDF-иконкой: {e}")
+        return None
+
+    log("    [fb] --- клик по ЭП-иконке ---")
+    if not _fb_click_hoverable(driver, sig_icon, "sig"):
+        log("    [fb] не удалось кликнуть по ЭП — стоп")
+        return None
+    log(f"    [fb] ждём {FB_WAIT_AFTER_CLICK} сек ...")
+    time.sleep(FB_WAIT_AFTER_CLICK)
+
+    log("    [fb] --- клик по ИМЕНИ PDF-файла ---")
+    try:
+        pdf_clickable = target_name_el.find_element(
+            By.XPATH,
+            "./ancestor::span[contains(@class, 'soh__trigger')][1]"
+        )
+        html_snippet = (pdf_clickable.get_attribute("outerHTML") or "")[:120]
+        log(f"    [fb] clickable PDF: {html_snippet!r}")
+    except Exception as e:
+        log(f"    [fb] не удалось найти кликабельный родитель PDF: {e}")
+        return None
+
+    if not _fb_click_hoverable(driver, pdf_clickable, "pdf_name"):
+        log("    [fb] не удалось кликнуть по имени PDF — стоп")
+        return None
+    log(f"    [fb] ждём {FB_WAIT_AFTER_CLICK} сек ...")
+    time.sleep(FB_WAIT_AFTER_CLICK)
+
+    pdf_files = [f for f in DOWNLOADS.iterdir()
+                 if f.is_file() and f.suffix.lower() == ".pdf"]
+    p7s_files = [f for f in DOWNLOADS.iterdir()
+                 if f.is_file() and f.suffix.lower() in (".p7s", ".sig")]
+
+    log(f"    [fb] в Downloads: pdf={len(pdf_files)} p7s={len(p7s_files)}")
+    for f in pdf_files + p7s_files:
+        try:
+            log(f"        {f.name!r}  size={f.stat().st_size}")
+        except Exception:
+            pass
+
+    if len(pdf_files) != 1 or len(p7s_files) != 1:
+        log("    [fb] ожидалась ровно 1 пара PDF+P7S — не сложилось")
+        return None
+
+    return [pdf_files[0], p7s_files[0]]
 
 # ============================== ГИС ЖКХ ==============================
 def open_uk_tab(driver, wait: WebDriverWait):
@@ -641,7 +790,6 @@ def read_contract_date(driver):
 
 # ============================== СБОР ПОЛЕЙ С ГИС ЖКХ ==============================
 def count_pdf_icons(driver) -> int:
-    """Считает иконки PDF на странице МКД."""
     try:
         els = driver.find_elements(
             By.CSS_SELECTOR,
@@ -652,10 +800,6 @@ def count_pdf_icons(driver) -> int:
         return -1
 
 def collect_pdf_pairs(driver) -> list:
-    """
-    Собирает пары (заявленное, фактическое) со страницы МКД.
-    Возвращает список кортежей, порядок — как на странице.
-    """
     pairs = []
     try:
         rows = driver.find_elements(
@@ -724,24 +868,46 @@ def collect_pdf_pairs(driver) -> list:
 
 def find_contract_actual_name(pairs: list):
     """
-    Возвращает фактическое имя PDF-договора, если найден РОВНО один
-    по маркеру 'договор'/'ду' в заявленном имени, и у него есть
-    непустое фактическое. Иначе — ''.
+    Возвращает фактическое имя PDF-договора.
+    Логика:
+      - среди пар ищем те, где заявленное имя содержит 'договор|ду';
+      - если ровно 1 — берём её;
+      - если >1 — пытаемся отсеять допы по маркерам 'к ду' / 'к договор';
+        после отсева должен остаться РОВНО 1;
+      - иначе — ''.
     """
     hits = [(d, a) for (d, a) in pairs if d and CONTRACT_RE.search(d)]
     if not hits:
         log(f"    [multi] маркер 'договор|ду' не найден среди {len(pairs)} пар")
         return ""
-    if len(hits) > 1:
-        log(f"    [multi] маркер найден в {len(hits)} парах — мультиархив")
-        for d, a in hits:
-            log(f"      - {d!r} -> {a!r}")
+
+    if len(hits) == 1:
+        d, a = hits[0]
+        if not a:
+            log(f"    [multi] договор найден ({d!r}), но фактическое имя пусто")
+            return ""
+        log(f"    [multi] договор: {d!r} -> actual={a!r}")
+        return a
+
+    # 2+ кандидата — пробуем отсеять допы
+    log(f"    [multi] маркер 'договор|ду' найден в {len(hits)} парах:")
+    for d, a in hits:
+        is_add = bool(ADDENDUM_RE.search(d or ""))
+        log(f"      - {d!r} -> {a!r}{'  [ДОП]' if is_add else ''}")
+
+    main_hits = [(d, a) for (d, a) in hits
+                 if not ADDENDUM_RE.search(d or "")]
+    log(f"    [multi] после отсева допов осталось {len(main_hits)}")
+
+    if len(main_hits) != 1:
+        log(f"    [multi] не удалось однозначно выбрать договор — пропуск")
         return ""
-    d, a = hits[0]
+
+    d, a = main_hits[0]
     if not a:
         log(f"    [multi] договор найден ({d!r}), но фактическое имя пусто")
         return ""
-    log(f"    [multi] договор: {d!r} -> actual={a!r}")
+    log(f"    [multi] договор (после отсева): {d!r} -> actual={a!r}")
     return a
 
 def collect_house_info(driver):
@@ -811,24 +977,34 @@ def collect_house_info(driver):
     if info["date"] == "unknown":
         info["date"] = ""
 
-    # --- иконки и пары ---
     info["pdf_icons"] = count_pdf_icons(driver)
     if info["pdf_icons"] > 1:
         info["pairs"] = collect_pdf_pairs(driver)
 
-    # --- для мультиархива: заявленное имя договора берём из пар ---
+    # --- выбор основного договора из пар (с отсевом допов) ---
     if info["pdf_icons"] > 1 and info["pairs"]:
         hits = [(d, a) for (d, a) in info["pairs"]
                 if d and CONTRACT_RE.search(d)]
         if len(hits) == 1:
             info["pdf_name"] = hits[0][0]
             log(f"    [house] pdf_name из пары: {info['pdf_name']!r}")
+        elif len(hits) > 1:
+            log(f"    [house] маркер 'договор|ду' найден в {len(hits)} парах:")
+            for d, a in hits:
+                is_add = bool(ADDENDUM_RE.search(d or ""))
+                log(f"      - {d!r} -> {a!r}{'  [ДОП]' if is_add else ''}")
+            main_hits = [(d, a) for (d, a) in hits
+                         if not ADDENDUM_RE.search(d or "")]
+            log(f"    [house] после отсева допов осталось {len(main_hits)}")
+            if len(main_hits) == 1:
+                info["pdf_name"] = main_hits[0][0]
+                log(f"    [house] pdf_name (после отсева допов): "
+                    f"{info['pdf_name']!r}")
 
     # --- fallback: если всё ещё пусто — ищем .pdf в body ---
     if not info["pdf_name"]:
         try:
             body = driver.find_element(By.TAG_NAME, "body").text
-            # ищем имя файла с расширением .pdf, допуская пробелы внутри
             m = re.search(r"([^\n\r\\/]{2,200}?\.pdf)", body)
             if m:
                 info["pdf_name"] = m.group(1).strip()
@@ -953,7 +1129,6 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
 
     contract_date = read_contract_date(driver)
 
-    # --- ПРАВКА 1: задержка 2 сек перед скриншотом 01_mkd ---
     time.sleep(2)
 
     download_btn = None
@@ -977,7 +1152,6 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
                        f"МКД, дата ДУ(У)={contract_date}")
     time.sleep(0.5)
 
-    # --- Проверка 0 иконок → дом пропускаем ---
     if house_info["pdf_icons"] == 0:
         log("    pdf_icons=0 — документов нет, дом пропускаем")
         close_tabs_except(driver, [ufo_handle, gis_handle])
@@ -986,92 +1160,107 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
         log_line("NO_DOCUMENTS", contract_date, "-")
         return True
 
-    if download_btn is None:
-        close_tabs_except(driver, [ufo_handle, gis_handle])
-        driver.switch_to.window(gis_handle)
-        inject_timestamp_overlay(driver)
-        log_line("NO_DOWNLOAD_BTN", contract_date, "-")
-        return True
-
-    # --- Мультиархив: заранее определяем фактическое имя договора ---
-    actual_pdf_name = ""
-    if house_info["pdf_icons"] > 1:
-        actual_pdf_name = find_contract_actual_name(house_info["pairs"])
-        if not actual_pdf_name:
-            log("    pdf_icons>1, но договор не определён однозначно — пропуск")
-            close_tabs_except(driver, [ufo_handle, gis_handle])
-            driver.switch_to.window(gis_handle)
-            inject_timestamp_overlay(driver)
-            log_line("MULTI_CONTRACT", contract_date, "-")
-            return True
-        log(f"    multi: ожидаем PDF '{actual_pdf_name}'")
-
-    # --- Скачивание ZIP ---
-    driver.execute_script("arguments[0].click();", download_btn)
-    time.sleep(3)
-
-    zip_file = wait_file(DOWNLOADS, r"Документы из ГИС ЖКХ.*\.zip", timeout=60)
-    if zip_file is None:
-        log("    ZIP не скачался")
-        close_tabs_except(driver, [ufo_handle, gis_handle])
-        driver.switch_to.window(gis_handle)
-        inject_timestamp_overlay(driver)
-        log_line("ZIP_FAIL", contract_date, "-")
-        return True
-
-    if not extract_zip(zip_file, IN_DIR):
-        log("    ZIP не распаковался")
-        try:
-            zip_file.unlink()
-        except Exception:
-            pass
-        close_tabs_except(driver, [ufo_handle, gis_handle])
-        driver.switch_to.window(gis_handle)
-        inject_timestamp_overlay(driver)
-        log_line("ZIP_FAIL", contract_date, "-")
-        return True
-
-    driver.switch_to.window(ufo_handle)
-    inject_timestamp_overlay(driver)
-    set_ufo_zoom(driver)
-
-    # --- Выбор пары: single или multi ---
     pdf = None
     p7s = None
-    if house_info["pdf_icons"] > 1:
-        pairs, pdf_path = find_pdf_p7s_pair_multi(IN_DIR, actual_pdf_name)
-        if pdf_path is None:
-            log("    [multi] PDF с фактическим именем не найден — пропуск")
-            move_to_old([zip_file])
-            clean_dir_files(IN_DIR)
+    zip_file = None
+
+    if download_btn is None:
+        log("    кнопки 'Скачать все' нет — пробуем пофайловое скачивание")
+        clean_dir_files(DOWNLOADS)
+        fb_pair = download_files_individually(driver, wait)
+        if fb_pair is None:
+            log("    fallback не сработал — NO_DOWNLOAD_BTN")
             close_tabs_except(driver, [ufo_handle, gis_handle])
             driver.switch_to.window(gis_handle)
             inject_timestamp_overlay(driver)
-            log_line("NO_PDF_IN_ARCHIVE", contract_date, "-")
+            log_line("NO_DOWNLOAD_BTN", contract_date, "-")
             return True
-        if not pairs:
-            log("    [multi] P7S не найден или их больше одного — пропуск")
-            move_to_old([zip_file])
-            clean_dir_files(IN_DIR)
+        pdf_dl, p7s_dl = fb_pair
+        try:
+            shutil.move(str(pdf_dl), str(IN_DIR / pdf_dl.name))
+            shutil.move(str(p7s_dl), str(IN_DIR / p7s_dl.name))
+        except Exception as e:
+            log(f"    fallback: не удалось перенести файлы в IN_DIR: {e}")
+            clean_dir_files(DOWNLOADS)
             close_tabs_except(driver, [ufo_handle, gis_handle])
             driver.switch_to.window(gis_handle)
             inject_timestamp_overlay(driver)
-            log_line("NO_OR_MULTI_P7S", contract_date, "-")
+            log_line("NO_DOWNLOAD_BTN", contract_date, "-")
             return True
-        pdf, p7s = pairs[0]
-        log(f"    [multi] пара: {pdf.name} + {p7s.name}")
+        clean_dir_files(DOWNLOADS)
+        pdf = IN_DIR / pdf_dl.name
+        p7s = IN_DIR / p7s_dl.name
+        log(f"    fallback: пара {pdf.name} + {p7s.name} перенесена в IN_DIR")
     else:
-        pairs = find_pdf_p7s_pair_single(IN_DIR)
-        if not pairs:
-            log("    [single] NOT_A_CONTRACT: не 1 PDF + 1 P7S или имена не совпали")
-            move_to_old([zip_file])
-            clean_dir_files(IN_DIR)
+        driver.execute_script("arguments[0].click();", download_btn)
+        time.sleep(3)
+
+        zip_file = wait_file(DOWNLOADS, r"Документы из ГИС ЖКХ.*\.zip", timeout=30)
+        if zip_file is None:
+            log("    ZIP не скачался")
             close_tabs_except(driver, [ufo_handle, gis_handle])
             driver.switch_to.window(gis_handle)
             inject_timestamp_overlay(driver)
-            log_line("NOT_A_CONTRACT", contract_date, "-")
+            log_line("ZIP_FAIL", contract_date, "-")
             return True
-        pdf, p7s = pairs[0]
+
+        if not extract_zip(zip_file, IN_DIR):
+            log("    ZIP не распаковался")
+            try:
+                zip_file.unlink()
+            except Exception:
+                pass
+            close_tabs_except(driver, [ufo_handle, gis_handle])
+            driver.switch_to.window(gis_handle)
+            inject_timestamp_overlay(driver)
+            log_line("ZIP_FAIL", contract_date, "-")
+            return True
+
+        if house_info["pdf_icons"] > 1:
+            actual_pdf_name = find_contract_actual_name(house_info["pairs"])
+            if not actual_pdf_name:
+                log("    pdf_icons>1, но договор не определён однозначно — пропуск")
+                move_to_old([zip_file])
+                clean_dir_files(IN_DIR)
+                close_tabs_except(driver, [ufo_handle, gis_handle])
+                driver.switch_to.window(gis_handle)
+                inject_timestamp_overlay(driver)
+                log_line("MULTI_CONTRACT", contract_date, "-")
+                return True
+            log(f"    multi: ожидаем PDF '{actual_pdf_name}'")
+            pairs, pdf_path = find_pdf_p7s_pair_multi(IN_DIR, actual_pdf_name)
+            if pdf_path is None:
+                log("    [multi] PDF с фактическим именем не найден — пропуск")
+                move_to_old([zip_file])
+                clean_dir_files(IN_DIR)
+                close_tabs_except(driver, [ufo_handle, gis_handle])
+                driver.switch_to.window(gis_handle)
+                inject_timestamp_overlay(driver)
+                log_line("NO_PDF_IN_ARCHIVE", contract_date, "-")
+                return True
+            if not pairs:
+                log("    [multi] P7S не найден или их больше одного — пропуск")
+                move_to_old([zip_file])
+                clean_dir_files(IN_DIR)
+                close_tabs_except(driver, [ufo_handle, gis_handle])
+                driver.switch_to.window(gis_handle)
+                inject_timestamp_overlay(driver)
+                log_line("NO_OR_MULTI_P7S", contract_date, "-")
+                return True
+            pdf, p7s = pairs[0]
+            log(f"    [multi] пара: {pdf.name} + {p7s.name}")
+        else:
+            pairs = find_pdf_p7s_pair_single(IN_DIR)
+            if not pairs:
+                log("    [single] NOT_A_CONTRACT: не 1 PDF + 1 P7S или имена не совпали")
+                move_to_old([zip_file])
+                clean_dir_files(IN_DIR)
+                close_tabs_except(driver, [ufo_handle, gis_handle])
+                driver.switch_to.window(gis_handle)
+                inject_timestamp_overlay(driver)
+                log_line("NOT_A_CONTRACT", contract_date, "-")
+                return True
+            pdf, p7s = pairs[0]
 
     file_stem = pdf.stem
 
@@ -1080,6 +1269,10 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
             fh.write(f"# {file_stem} | pending_01_mkd\n")
     except Exception:
         pass
+
+    driver.switch_to.window(ufo_handle)
+    inject_timestamp_overlay(driver)
+    set_ufo_zoom(driver)
 
     pdf_input = wait.until(EC.presence_of_element_located(
         (By.CSS_SELECTOR,
@@ -1139,7 +1332,6 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
         result_text = ""
         marker = None
 
-    # --- Запись в новый лог ---
     try:
         if (marker in ("Ж", "Н")
                 and scr_mkd and scr_ufo_loaded and scr_ufo_result
@@ -1150,7 +1342,8 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
                 and ep_name):
             if contract_log_written(house_info["org"],
                                     house_info["date"],
-                                    house_info["pdf_name"]):
+                                    house_info["pdf_name"],
+                                    house_info["addr"]):
                 log("    [contract-log] already written, skip")
             else:
                 write_contract_log(
@@ -1191,6 +1384,7 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
 
     move_to_old([pdf, p7s, zip_file])
     clean_dir_files(IN_DIR)
+    clean_dir_files(DOWNLOADS)
 
     close_tabs_except(driver, [ufo_handle, gis_handle])
     driver.switch_to.window(gis_handle)
@@ -1219,6 +1413,10 @@ def next_page(driver, gis_handle) -> bool:
 # ============================== MAIN ==============================
 def build_driver() -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
+    # --- Убираем инфопанель "Chrome управляется автоматической программой" ---
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+    # ------------------------------------------------------------------------
     prefs = {
         "download.default_directory": str(DOWNLOADS),
         "download.prompt_for_download": False,
@@ -1341,4 +1539,5 @@ def main():
         f"errors_uk={err_uk} TOTAL_MKD={total_mkd}")
 
 if __name__ == "__main__":
+    main()
     main()
