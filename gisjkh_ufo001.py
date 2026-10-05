@@ -10,6 +10,22 @@ gisjkh-ufo.py — полный прогон по списку ОГРН из ogrn
                   при нескольких кандидатах отсеиваются допы
                   (по маркерам 'к ду' / 'к договор'); должен остаться ровно 1;
         * fallback: кнопки 'Скачать все' нет — качаем PDF и P7S по отдельности.
+
+Дополнительно:
+    - 4-й скриншот — первая страница PDF-договора (04_pdf_first),
+      через data:text/html;base64 в текущей вкладке УФО.
+    - Площади из карточки дома (totalSquare, residentialSquare)
+      читаются СРАЗУ после открытия карточки дома (card_handle),
+      до перехода на "Информацию об управлении МКД".
+      Пишутся во вторую строку блока contracts.log:
+         scrNNNN.jpg - (<Pз>)-<Pж>=<Δ> -- <ep_name>
+      где Δ = Pз − Pж. В отчёт идёт только если Δ < 0.
+
+Формат contracts.log (одна запись = 4 или 5 строк + пустая):
+    scr_a - <org> -- <addr> --- <pdf_name> ---- <date>
+    scr_b - (<Pз>)-<Pж>=<Δ> -- <ep_name>
+    scr_c - <marker>
+    [scr_pdf]
 """
 
 import os
@@ -17,8 +33,10 @@ import re
 import time
 import random
 import shutil
+import base64
 import subprocess
 import datetime as _dt
+import urllib.parse
 from pathlib import Path
 from tempfile import gettempdir
 
@@ -74,16 +92,16 @@ EP_PREFIX_RE = re.compile(
 )
 
 CONTRACT_RE = re.compile(r"договор|(?<![а-яё])ду(?![а-яё])", re.IGNORECASE)
-
-# Маркер «это доп. соглашение, а не основной договор»
 ADDENDUM_RE = re.compile(r"к\s*ду|к\s*договор", re.IGNORECASE)
-
 RE_FACTUAL = re.compile(r"^(.*?)\s*\(\s*\d")
 
-# --- Параметры «последней надежды» (пофайловое скачивание) ---
-FB_WAIT_RENDER = 5        # ожидание отрисовки страницы МКД
-FB_WAIT_AFTER_CLICK = 7   # пауза после клика (ЭП, PDF)
-FB_PDF_MARKERS = ("договор", "ду")  # маркеры для отбора PDF по имени
+FB_WAIT_RENDER = 5
+FB_WAIT_AFTER_CLICK = 7
+FB_PDF_MARKERS = ("договор", "ду")
+
+PDF_FIRST_W = 1920
+PDF_FIRST_H = 953
+PDF_FIRST_DPI = 150
 
 # ============================== PIEXIF ==============================
 try:
@@ -93,6 +111,23 @@ except ImportError:
     _HAS_PIEXIF = False
     print("[!] piexif не установлен. EXIF писаться не будет. "
           "Установи: pip install piexif")
+
+# ============================== PDF RENDER ==============================
+try:
+    import fitz  # PyMuPDF
+    _HAS_FITZ = True
+except ImportError:
+    _HAS_FITZ = False
+    print("[!] PyMuPDF не установлен. Скриншот первой страницы PDF "
+          "делаться не будет. Установи: pip install pymupdf")
+
+try:
+    from PIL import Image
+    _HAS_PIL = True
+except ImportError:
+    _HAS_PIL = False
+    print("[!] Pillow не установлен. Скриншот первой страницы PDF "
+          "делаться не будет. Установи: pip install pillow")
 
 # ============================== ЛОГ ==============================
 def log(msg: str):
@@ -174,18 +209,28 @@ def contract_log_written(org: str, date_str: str,
 
 def write_contract_log(scr_a: str, scr_b: str, scr_c: str,
                        org: str, addr: str, pdf_name: str, date_str: str,
-                       ep_name: str, marker: str):
+                       ep_name: str, marker: str,
+                       scr_pdf: str = "",
+                       delta_str: str = ""):
     line1 = f"{scr_a} - {org} -- {addr} --- {pdf_name} ---- {date_str}"
-    line2 = f"{scr_b} - {pdf_name} -- {ep_name}"
+    if delta_str:
+        line2 = f"{scr_b} - {delta_str} -- {ep_name}"
+    else:
+        line2 = f"{scr_b} - {ep_name}"
     line3 = f"{scr_c} - {marker}"
+    line4 = scr_pdf if scr_pdf else ""
     try:
         CONTRACT_LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(CONTRACT_LOG, "a", encoding="utf-8", newline="") as fh:
             fh.write(line1 + "\r\n")
             fh.write(line2 + "\r\n")
             fh.write(line3 + "\r\n")
+            if line4:
+                fh.write(line4 + "\r\n")
             fh.write("\r\n")
-        log(f"    [contract-log] written: {line3}")
+        log(f"    [contract-log] written: {line3}"
+            + (f" / {line4}" if line4 else "")
+            + (f"  delta={delta_str}" if delta_str else ""))
     except Exception as e:
         print(f"[!] cannot write contract log: {e}", flush=True)
 
@@ -231,17 +276,26 @@ def snapshot(driver, tag: str, file_stem: str, extra: str = ""):
                 dt_str = now.strftime("%Y:%m:%d %H:%M:%S")
                 tz_str = now.strftime("%z")
                 tz_formatted = f"{tz_str[0]}{tz_str[1:3]}:{tz_str[3:5]}"
+
+                cur_url = driver.current_url or ""
+                if cur_url.startswith("data:"):
+                    cur_url = "http://localhost/view.htm"
+                elif len(cur_url) > 900:
+                    cur_url = cur_url[:900] + "..."
+
+                extra_safe = (extra or "")[:900]
+
                 exif_dict = {
                     "0th": {
                         piexif.ImageIFD.DateTime: dt_str.encode(),
-                        piexif.ImageIFD.ImageDescription: driver.current_url.encode(),
-                        piexif.ImageIFD.Copyright: COPYRIGHT.encode(),
+                        piexif.ImageIFD.ImageDescription: cur_url.encode("utf-8", "ignore"),
+                        piexif.ImageIFD.Copyright: COPYRIGHT.encode("utf-8", "ignore"),
                     },
                     "Exif": {
                         piexif.ExifIFD.DateTimeOriginal: dt_str.encode(),
                         piexif.ExifIFD.DateTimeDigitized: dt_str.encode(),
                         piexif.ExifIFD.OffsetTimeOriginal: tz_formatted.encode(),
-                        piexif.ExifIFD.UserComment: extra.encode(),
+                        piexif.ExifIFD.UserComment: extra_safe.encode("utf-8", "ignore"),
                     },
                     "GPS": {},
                     "1st": {},
@@ -272,6 +326,152 @@ def snapshot(driver, tag: str, file_stem: str, extra: str = ""):
     except Exception as e:
         print(f"[!] snapshot failed: {e}")
         return None
+
+# ============================== PDF FIRST PAGE ==============================
+def _render_pdf_first_page(pdf_path: Path, out_png: Path) -> bool:
+    if not _HAS_FITZ or not _HAS_PIL:
+        log("    [pdf] PyMuPDF/Pillow недоступны — пропуск")
+        return False
+    raw_png = out_png.with_name(out_png.stem + "_raw.png")
+    try:
+        doc = fitz.open(str(pdf_path))
+        if doc.page_count == 0:
+            doc.close()
+            log("    [pdf] PDF пуст")
+            return False
+        page = doc.load_page(0)
+        zoom = PDF_FIRST_DPI / 72.0
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        pix.save(str(raw_png))
+        doc.close()
+
+        img = Image.open(raw_png).convert("RGB")
+        w, h = img.size
+        new_w = PDF_FIRST_W
+        new_h = int(round(h * new_w / w))
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+        if new_h >= PDF_FIRST_H:
+            img = img.crop((0, 0, new_w, PDF_FIRST_H))
+        else:
+            canvas = Image.new("RGB", (new_w, PDF_FIRST_H), (255, 255, 255))
+            canvas.paste(img, (0, 0))
+            img.close()
+            img = canvas
+        img.save(out_png, "PNG")
+        img.close()
+        log(f"    [pdf] рендер первой страницы: {out_png.name} "
+            f"({out_png.stat().st_size} байт)")
+        return True
+    except Exception as e:
+        log(f"    [pdf] рендер упал: {type(e).__name__}: {e}")
+        return False
+    finally:
+        try:
+            if raw_png.exists():
+                raw_png.unlink()
+        except Exception:
+            pass
+
+
+def _build_pdf_view_data_url(png_path: Path) -> str:
+    with open(png_path, "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode("ascii")
+    html = (
+        "<!DOCTYPE html><html lang='ru'><head><meta charset='utf-8'>"
+        "<title>view</title><style>"
+        "html,body{margin:0;padding:0;background:#fff;overflow:hidden;}"
+        f"img{{width:{PDF_FIRST_W}px;height:{PDF_FIRST_H}px;display:block;}}"
+        "</style></head><body>"
+        f"<img src='data:image/png;base64,{b64}' alt='scan'>"
+        "</body></html>"
+    )
+    return "data:text/html;charset=utf-8," + urllib.parse.quote(html)
+
+
+_PDF_TS_JS = r"""
+(function() {
+    var OVERRIDE_URL = 'http://localhost/view.htm';
+    var hostId = '__ts_host__';
+    var host = document.getElementById(hostId);
+    if (!host) {
+        host = document.createElement('div');
+        host.id = hostId;
+        host.style.cssText = [
+            'all: initial !important','position: fixed !important',
+            'right: 10px !important','bottom: 10px !important',
+            'width: 0 !important','height: 0 !important',
+            'z-index: 2147483647 !important','pointer-events: none !important',
+            'margin: 0 !important','padding: 0 !important','border: 0 !important'
+        ].join('; ');
+        document.documentElement.appendChild(host);
+        var shadow = host.attachShadow({ mode: 'open' });
+        var style = document.createElement('style');
+        style.textContent = `
+            .ts-box {
+                position: fixed; right: 10px; bottom: 10px;
+                background: rgba(0,0,0,0.82); color: #00ff00;
+                font: 14px/1.3 monospace; padding: 6px 10px;
+                border-radius: 6px; white-space: pre; text-align: left;
+                box-shadow: 0 0 6px rgba(0,255,0,0.6);
+                pointer-events: none; z-index: 2147483647;
+                max-width: 90vw; width: auto; height: auto;
+            }`;
+        shadow.appendChild(style);
+        var box = document.createElement('div');
+        box.className = 'ts-box'; box.id = '__ts_box__';
+        shadow.appendChild(box);
+    }
+    var shadowRoot = host.shadowRoot;
+    var box = shadowRoot.getElementById('__ts_box__');
+    if (!box) return;
+    function fmt(d) {
+        function p(n){ return n<10 ? '0'+n : ''+n; }
+        return d.getFullYear()+'-'+p(d.getMonth()+1)+'-'+p(d.getDate())+' '
+             + p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+    }
+    function tick() {
+        var d = new Date();
+        var tz = Intl.DateTimeFormat().resolvedOptions().timeZone || '';
+        box.textContent = fmt(d) + '  ' + tz + '\n' + OVERRIDE_URL;
+    }
+    tick();
+    if (!window.__ts_interval__) window.__ts_interval__ = setInterval(tick, 1000);
+})();
+"""
+
+
+def snapshot_pdf_first_page(driver, pdf_path: Path,
+                            file_stem: str, extra: str = ""):
+    if not _HAS_FITZ or not _HAS_PIL:
+        log("    [pdf-snap] нет PyMuPDF/Pillow — пропуск")
+        return None
+
+    png_path = IN_DIR / f"_pdf_first_{file_stem}.png"
+    try:
+        if not _render_pdf_first_page(pdf_path, png_path):
+            return None
+        data_url = _build_pdf_view_data_url(png_path)
+        log("    [pdf-snap] открываю data: URL в текущей вкладке")
+        driver.get(data_url)
+        time.sleep(1.5)
+        try:
+            driver.execute_script(_PDF_TS_JS)
+        except Exception as e:
+            log(f"    [pdf-snap] overlay: {e}")
+        time.sleep(1.0)
+        scr = snapshot(driver, "04_pdf_first", file_stem, extra)
+        return scr
+    except Exception as e:
+        log(f"    [pdf-snap] упал: {type(e).__name__}: {e}")
+        return None
+    finally:
+        try:
+            if png_path.exists():
+                png_path.unlink()
+        except Exception:
+            pass
+
 
 # ============================== ОВЕРЛЕЙ ==============================
 _TS_JS = r"""
@@ -749,15 +949,39 @@ def select_org(driver, wait: WebDriverWait, ogrn: str) -> bool:
 
 def set_page_size_100(driver, wait: WebDriverWait) -> bool:
     try:
-        select_el = wait.until(EC.presence_of_element_located(
-            (By.CSS_SELECTOR, "select#count")
-        ))
-        Select(select_el).select_by_value("100")
-        time.sleep(2)
+        candidates = driver.find_elements(By.CSS_SELECTOR, "select#count")
+    except Exception:
+        candidates = []
+
+    if not candidates:
+        log("    select#count отсутствует — домов мало, пагинация не нужна")
         return True
-    except Exception as e:
-        log(f"    cannot set page size 100: {e}")
-        return False
+
+    select_el = candidates[0]
+
+    try:
+        if not select_el.is_displayed() or not select_el.is_enabled():
+            log("    select#count не виден/неактивен — пропускаем")
+            return True
+    except Exception:
+        pass
+
+    for attempt in range(1, 4):
+        try:
+            driver.execute_script(
+                "arguments[0].scrollIntoView({block:'center'});", select_el
+            )
+            time.sleep(0.5)
+            Select(select_el).select_by_value("100")
+            time.sleep(2)
+            log(f"    page size 100 set (attempt {attempt})")
+            return True
+        except Exception as e:
+            log(f"    set_page_size_100 attempt {attempt} failed: {e}")
+            time.sleep(1.5)
+
+    log("    set_page_size_100: не удалось, продолжаю как есть")
+    return True
 
 def read_contract_date(driver):
     label_text = "Дата заключения договора управления"
@@ -787,6 +1011,39 @@ def read_contract_date(driver):
     except Exception:
         pass
     return "unknown"
+
+# ============================== ПЛОЩАДИ ИЗ КАРТОЧКИ ==============================
+def _read_square(driver, ng_bind_fragment: str) -> str:
+    """
+    Достаёт значение из <td> по фрагменту ng-bind-html.
+    Селектор без класса — на карточке дома это работает.
+    Возвращает строку '714.9' или '' если не удалось.
+    """
+    try:
+        els = driver.find_elements(
+            By.CSS_SELECTOR,
+            f"td[ng-bind-html*='{ng_bind_fragment}']"
+        )
+        if not els:
+            return ""
+        raw = (els[0].text or "").strip()
+        m = re.search(r"(\d+(?:[.,]\d+)?)", raw)
+        if not m:
+            return ""
+        return m.group(1).replace(",", ".")
+    except Exception:
+        return ""
+
+
+def read_house_squares(driver) -> tuple:
+    """
+    Возвращает (p_total, p_residential) — строки или ''.
+    ВНИМАНИЕ: читать надо на СТРАНИЦЕ КАРТОЧКИ ДОМА
+    (/house-view?...), а не на "Информации об управлении МКД".
+    """
+    p_total = _read_square(driver, "totalSquare")
+    p_residential = _read_square(driver, "residentialSquare")
+    return p_total, p_residential
 
 # ============================== СБОР ПОЛЕЙ С ГИС ЖКХ ==============================
 def count_pdf_icons(driver) -> int:
@@ -867,15 +1124,6 @@ def collect_pdf_pairs(driver) -> list:
     return pairs
 
 def find_contract_actual_name(pairs: list):
-    """
-    Возвращает фактическое имя PDF-договора.
-    Логика:
-      - среди пар ищем те, где заявленное имя содержит 'договор|ду';
-      - если ровно 1 — берём её;
-      - если >1 — пытаемся отсеять допы по маркерам 'к ду' / 'к договор';
-        после отсева должен остаться РОВНО 1;
-      - иначе — ''.
-    """
     hits = [(d, a) for (d, a) in pairs if d and CONTRACT_RE.search(d)]
     if not hits:
         log(f"    [multi] маркер 'договор|ду' не найден среди {len(pairs)} пар")
@@ -889,7 +1137,6 @@ def find_contract_actual_name(pairs: list):
         log(f"    [multi] договор: {d!r} -> actual={a!r}")
         return a
 
-    # 2+ кандидата — пробуем отсеять допы
     log(f"    [multi] маркер 'договор|ду' найден в {len(hits)} парах:")
     for d, a in hits:
         is_add = bool(ADDENDUM_RE.search(d or ""))
@@ -910,9 +1157,15 @@ def find_contract_actual_name(pairs: list):
     log(f"    [multi] договор (после отсева): {d!r} -> actual={a!r}")
     return a
 
-def collect_house_info(driver):
+def collect_house_info(driver, p_total: str = "", p_residential: str = ""):
+    """
+    Собирает поля с "Информации об управлении МКД" (org, addr, pdf_name, date,
+    pdf_icons, pairs).
+    Площади приходят параметрами (их читают с карточки дома).
+    """
     info = {"org": "", "addr": "", "pdf_name": "", "date": "",
-            "pdf_icons": -1, "pairs": []}
+            "pdf_icons": -1, "pairs": [],
+            "p_total": p_total, "p_residential": p_residential}
 
     try:
         els = driver.find_elements(By.CSS_SELECTOR, "a.ctrl-link.ng-binding")
@@ -981,7 +1234,6 @@ def collect_house_info(driver):
     if info["pdf_icons"] > 1:
         info["pairs"] = collect_pdf_pairs(driver)
 
-    # --- выбор основного договора из пар (с отсевом допов) ---
     if info["pdf_icons"] > 1 and info["pairs"]:
         hits = [(d, a) for (d, a) in info["pairs"]
                 if d and CONTRACT_RE.search(d)]
@@ -1001,7 +1253,6 @@ def collect_house_info(driver):
                 log(f"    [house] pdf_name (после отсева допов): "
                     f"{info['pdf_name']!r}")
 
-    # --- fallback: если всё ещё пусто — ищем .pdf в body ---
     if not info["pdf_name"]:
         try:
             body = driver.find_element(By.TAG_NAME, "body").text
@@ -1087,6 +1338,20 @@ def collect_result_marker(driver):
 
     return result_text, marker
 
+# ============================== DELTA ==============================
+def build_delta_str(house_info: dict) -> str:
+    p_total = (house_info.get("p_total") or "").strip()
+    p_res = (house_info.get("p_residential") or "").strip()
+    if not p_total or not p_res:
+        return ""
+    try:
+        v_total = float(p_total)
+        v_res = float(p_res)
+    except Exception:
+        return ""
+    delta = v_total - v_res
+    return f"({p_total})-{p_res}={delta:g}"
+
 # ============================== ОСНОВНОЙ ЦИКЛ ==============================
 def process_one_house(driver, ufo_handle, gis_handle, index):
     print(f"[dbg] process_one_house: driver={type(driver).__name__} "
@@ -1108,6 +1373,7 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     if index >= len(links):
         return False
 
+    # --- открываем карточку дома (card_handle) ---
     card_handle = open_new_tab_and_switch(
         driver, wait,
         lambda: driver.execute_script(
@@ -1118,6 +1384,15 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     )
     time.sleep(2)
 
+    # --- читаем площади СРАЗУ, пока мы на карточке дома ---
+    p_total, p_res = "", ""
+    try:
+        p_total, p_res = read_house_squares(driver)
+        log(f"    [squares] total={p_total!r} residential={p_res!r}")
+    except Exception as e:
+        log(f"    [squares] ошибка чтения: {e}")
+
+    # --- переходим на "Информацию об управлении МКД" (mgmt_handle) ---
     mgmt_link = wait.until(EC.presence_of_element_located(
         (By.XPATH, "//a[contains(., 'Информация об управлении МКД')]")
     ))
@@ -1128,7 +1403,6 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     )
 
     contract_date = read_contract_date(driver)
-
     time.sleep(2)
 
     download_btn = None
@@ -1141,12 +1415,14 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     except TimeoutException:
         log("    кнопка скачивания не появилась — документов нет")
 
-    house_info = collect_house_info(driver)
+    house_info = collect_house_info(driver, p_total=p_total, p_residential=p_res)
     log(f"    house_info: org={house_info['org']!r} "
         f"addr={house_info['addr']!r} "
         f"pdf={house_info['pdf_name']!r} "
         f"date={house_info['date']!r} "
-        f"pdf_icons={house_info['pdf_icons']}")
+        f"pdf_icons={house_info['pdf_icons']} "
+        f"p_total={house_info['p_total']!r} "
+        f"p_res={house_info['p_residential']!r}")
 
     scr_mkd = snapshot(driver, "01_mkd", "pending",
                        f"МКД, дата ДУ(У)={contract_date}")
@@ -1332,6 +1608,22 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
         result_text = ""
         marker = None
 
+    # --- 4-й скриншот: первая страница PDF-договора ---
+    scr_pdf_first = None
+    try:
+        if pdf is not None and pdf.exists():
+            scr_pdf_first = snapshot_pdf_first_page(
+                driver, pdf, file_stem,
+                f"{file_stem} | ДУ(У)={contract_date} | первая страница PDF"
+            )
+        else:
+            log("    [pdf-snap] PDF недоступен — пропуск")
+    except Exception as e:
+        log(f"    [pdf-snap] ошибка: {type(e).__name__}: {e}")
+
+    delta_str = build_delta_str(house_info)
+    log(f"    [delta] {delta_str!r}")
+
     try:
         if (marker in ("Ж", "Н")
                 and scr_mkd and scr_ufo_loaded and scr_ufo_result
@@ -1354,21 +1646,33 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
                     house_info["date"],
                     ep_name,
                     marker,
+                    scr_pdf=scr_pdf_first or "",
+                    delta_str=delta_str,
                 )
         else:
             log("    [contract-log] conditions not met, skip")
     except Exception as e:
         log(f"    [contract-log] error: {e}")
 
-    try:
-        back_link = WebDriverWait(driver, 5).until(EC.element_to_be_clickable(
-            (By.XPATH, "//a[contains(., 'Назад')]")
-        ))
-        driver.execute_script("arguments[0].click();", back_link)
-        time.sleep(1)
-    except Exception:
-        driver.get(UFO_URL)
-        time.sleep(1)
+    # --- Возврат на УФО ---
+    if scr_pdf_first:
+        try:
+            driver.get(UFO_URL)
+            time.sleep(2)
+        except Exception as e:
+            log(f"    [pdf-snap] возврат на УФО упал: {e}")
+    else:
+        try:
+            back_link = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable(
+                    (By.XPATH, "//a[contains(., 'Назад')]")
+                )
+            )
+            driver.execute_script("arguments[0].click();", back_link)
+            time.sleep(1)
+        except Exception:
+            driver.get(UFO_URL)
+            time.sleep(1)
 
     set_ufo_zoom(driver)
     inject_timestamp_overlay(driver)
@@ -1413,10 +1717,8 @@ def next_page(driver, gis_handle) -> bool:
 # ============================== MAIN ==============================
 def build_driver() -> webdriver.Chrome:
     options = webdriver.ChromeOptions()
-    # --- Убираем инфопанель "Chrome управляется автоматической программой" ---
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option("useAutomationExtension", False)
-    # ------------------------------------------------------------------------
     prefs = {
         "download.default_directory": str(DOWNLOADS),
         "download.prompt_for_download": False,
