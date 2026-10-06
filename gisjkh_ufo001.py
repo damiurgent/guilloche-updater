@@ -19,7 +19,11 @@ gisjkh-ufo.py — полный прогон по списку ОГРН из ogrn
       до перехода на "Информацию об управлении МКД".
       Пишутся во вторую строку блока contracts.log:
          scrNNNN.jpg - (<Pз>)-<Pж>=<Δ> -- <ep_name>
-      где Δ = Pз − Pж. В отчёт идёт только если Δ < 0.
+      где Δ = Pз − Pж.
+    - Если PDF < PDF_STUB_THRESHOLD (5 KB) — это HTML-заглушка (404).
+      Рендерим её содержимое как текст Courier New на PNG 1920x953
+      и делаем скриншот. Так в отчёте видно, что вместо договора
+      ГИС ЖКХ отдал заглушку.
 
 Формат contracts.log (одна запись = 4 или 5 строк + пустая):
     scr_a - <org> -- <addr> --- <pdf_name> ---- <date>
@@ -91,17 +95,30 @@ EP_PREFIX_RE = re.compile(
     flags=re.IGNORECASE
 )
 
-CONTRACT_RE = re.compile(r"договор|(?<![а-яё])ду(?![а-яё])", re.IGNORECASE)
+CONTRACT_RE = re.compile(
+    r"договор|(?<![а-яё])дог(?![а-яё])|dog|(?<![а-яё])ду(?![а-яё])",
+    re.IGNORECASE
+)
 ADDENDUM_RE = re.compile(r"к\s*ду|к\s*договор", re.IGNORECASE)
 RE_FACTUAL = re.compile(r"^(.*?)\s*\(\s*\d")
 
 FB_WAIT_RENDER = 5
 FB_WAIT_AFTER_CLICK = 7
-FB_PDF_MARKERS = ("договор", "ду")
+FB_PDF_MARKERS = ("договор", "ду", "дог", "dog")
 
+# --- скриншот первой страницы PDF / HTML-заглушки ---
 PDF_FIRST_W = 1920
 PDF_FIRST_H = 953
 PDF_FIRST_DPI = 150
+PDF_STUB_THRESHOLD = 5 * 1024   # < 5 KB считаем HTML-заглушкой
+
+# --- параметры отрисовки заглушки ---
+STUB_FONT_PATH = r"C:\Windows\Fonts\cour.ttf"       # Courier New
+STUB_MAX_FONT_SIZE = 28
+STUB_MIN_FONT_SIZE = 8
+STUB_MARGIN_X = 30
+STUB_MARGIN_Y = 30
+STUB_LINE_SPACING = 1.15
 
 # ============================== PIEXIF ==============================
 try:
@@ -122,7 +139,7 @@ except ImportError:
           "делаться не будет. Установи: pip install pymupdf")
 
 try:
-    from PIL import Image
+    from PIL import Image, ImageDraw, ImageFont
     _HAS_PIL = True
 except ImportError:
     _HAS_PIL = False
@@ -374,6 +391,64 @@ def _render_pdf_first_page(pdf_path: Path, out_png: Path) -> bool:
             pass
 
 
+# ============================== HTML-ЗАГЛУШКА ==============================
+def _measure_text(draw, text, font):
+    bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=0)
+    return bbox[2] - bbox[0], bbox[3] - bbox[1]
+
+
+def _pick_stub_font_size(draw, text: str) -> int:
+    max_w = PDF_FIRST_W - 2 * STUB_MARGIN_X
+    max_h = PDF_FIRST_H - 2 * STUB_MARGIN_Y
+    size = STUB_MAX_FONT_SIZE
+    while size >= STUB_MIN_FONT_SIZE:
+        try:
+            font = ImageFont.truetype(STUB_FONT_PATH, size)
+        except Exception:
+            # если шрифт не найден, отдаём минимальный
+            return STUB_MIN_FONT_SIZE
+        w, _h = _measure_text(draw, text, font)
+        lines = text.count("\n") + 1
+        h_total = int(lines * size * STUB_LINE_SPACING)
+        if w <= max_w and h_total <= max_h:
+            return size
+        size -= 1
+    return STUB_MIN_FONT_SIZE
+
+
+def _render_stub_png(png_path: Path, text: str) -> bool:
+    """
+    Рисует HTML-заглушку (или другой текст) на PNG 1920x953
+    моноширинным Courier New, подгоняя кегль под ширину/высоту.
+    """
+    if not _HAS_PIL:
+        log("    [stub] Pillow недоступен — пропуск")
+        return False
+    try:
+        img = Image.new("RGB", (PDF_FIRST_W, PDF_FIRST_H), (255, 255, 255))
+        draw = ImageDraw.Draw(img)
+
+        size = _pick_stub_font_size(draw, text)
+        try:
+            font = ImageFont.truetype(STUB_FONT_PATH, size)
+        except Exception:
+            font = ImageFont.load_default()
+            size = 12  # приблизительно
+
+        y = STUB_MARGIN_Y
+        for line in text.split("\n"):
+            draw.text((STUB_MARGIN_X, y), line, font=font, fill=(0, 0, 0))
+            y += int(size * STUB_LINE_SPACING)
+
+        img.save(png_path, "PNG")
+        log(f"    [stub] отрисована заглушка: {png_path.name} "
+            f"(кегль={size}, {png_path.stat().st_size} байт)")
+        return True
+    except Exception as e:
+        log(f"    [stub] ошибка отрисовки: {type(e).__name__}: {e}")
+        return False
+
+
 def _build_pdf_view_data_url(png_path: Path) -> str:
     with open(png_path, "rb") as fh:
         b64 = base64.b64encode(fh.read()).decode("ascii")
@@ -441,29 +516,101 @@ _PDF_TS_JS = r"""
 """
 
 
-def snapshot_pdf_first_page(driver, pdf_path: Path,
-                            file_stem: str, extra: str = ""):
-    if not _HAS_FITZ or not _HAS_PIL:
-        log("    [pdf-snap] нет PyMuPDF/Pillow — пропуск")
-        return None
+def _snapshot_png_in_tab(driver, png_path: Path, file_stem: str,
+                         extra: str = ""):
+    """
+    Открывает готовый PNG через data: URL в текущей вкладке,
+    накладывает оверлей и делает скриншот (04_pdf_first).
 
-    png_path = IN_DIR / f"_pdf_first_{file_stem}.png"
+    Ждём, пока страница реально переключится на data: URL
+    (при медленном VPN driver.get может не успеть — и в скриншот
+    попадёт предыдущая страница, например результат УФО).
+    """
     try:
-        if not _render_pdf_first_page(pdf_path, png_path):
-            return None
         data_url = _build_pdf_view_data_url(png_path)
-        log("    [pdf-snap] открываю data: URL в текущей вкладке")
         driver.get(data_url)
-        time.sleep(1.5)
+
+        # 1) ждём, пока current_url начнёт начинаться с data:
+        waited = 0.0
+        while waited < 15.0:
+            try:
+                cur = driver.current_url or ""
+            except Exception:
+                cur = ""
+            if cur.startswith("data:"):
+                break
+            time.sleep(0.5)
+            waited += 0.5
+        log(f"    [pdf-snap] data: URL активен через {waited:.1f}s")
+
+        # 2) ждём появления <img> с картинкой
+        waited_img = 0.0
+        while waited_img < 10.0:
+            try:
+                n = driver.execute_script(
+                    "return document.querySelectorAll('img').length;"
+                )
+            except Exception:
+                n = 0
+            if n and n > 0:
+                break
+            time.sleep(0.5)
+            waited_img += 0.5
+        log(f"    [pdf-snap] <img> найдено через {waited_img:.1f}s")
+
+        # 3) пауза на отрисовку картинки и оверлея
+        time.sleep(2.0)
+
         try:
             driver.execute_script(_PDF_TS_JS)
         except Exception as e:
             log(f"    [pdf-snap] overlay: {e}")
-        time.sleep(1.0)
+
+        time.sleep(1.5)
         scr = snapshot(driver, "04_pdf_first", file_stem, extra)
         return scr
     except Exception as e:
         log(f"    [pdf-snap] упал: {type(e).__name__}: {e}")
+        return None
+
+
+def snapshot_pdf_first_page(driver, pdf_path: Path,
+                            file_stem: str,
+                            file_size: int = 0,
+                            extra: str = ""):
+    """
+    Делает 4-й скриншот.
+    - если PDF < PDF_STUB_THRESHOLD — рендерит содержимое файла
+      как текст (HTML-заглушка) на PNG Courier New и снимает скрин;
+    - иначе — рендерит первую страницу PDF через PyMuPDF.
+    """
+    if not _HAS_PIL:
+        log("    [pdf-snap] нет Pillow — пропуск")
+        return None
+
+    png_path = IN_DIR / f"_pdf_first_{file_stem}.png"
+    try:
+        # --- случай 1: HTML-заглушка ---
+        if file_size > 0 and file_size < PDF_STUB_THRESHOLD:
+            log(f"    [pdf-snap] файл {file_size} байт < "
+                f"{PDF_STUB_THRESHOLD} — это HTML-заглушка")
+            try:
+                text = pdf_path.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                log(f"    [pdf-snap] не удалось прочитать файл: {e}")
+                text = f"[не удалось прочитать {pdf_path.name}]\n\n{e}"
+            if not _render_stub_png(png_path, text):
+                return None
+            scr = _snapshot_png_in_tab(driver, png_path, file_stem, extra)
+            return scr
+
+        # --- случай 2: настоящий PDF ---
+        if not _render_pdf_first_page(pdf_path, png_path):
+            return None
+        scr = _snapshot_png_in_tab(driver, png_path, file_stem, extra)
+        return scr
+    except Exception as e:
+        log(f"    [pdf-snap] ошибка: {type(e).__name__}: {e}")
         return None
     finally:
         try:
@@ -883,6 +1030,9 @@ def download_files_individually(driver, wait) -> list:
 
 # ============================== ГИС ЖКХ ==============================
 def open_uk_tab(driver, wait: WebDriverWait):
+    # дать сайту доинициализироваться и убрать возможные стартовые модалки
+    time.sleep(3)
+
     tab = wait.until(EC.element_to_be_clickable(
         (By.XPATH, "//a[contains(., 'Поиск дома по управляющей организации')]")
     ))
@@ -1014,11 +1164,6 @@ def read_contract_date(driver):
 
 # ============================== ПЛОЩАДИ ИЗ КАРТОЧКИ ==============================
 def _read_square(driver, ng_bind_fragment: str) -> str:
-    """
-    Достаёт значение из <td> по фрагменту ng-bind-html.
-    Селектор без класса — на карточке дома это работает.
-    Возвращает строку '714.9' или '' если не удалось.
-    """
     try:
         els = driver.find_elements(
             By.CSS_SELECTOR,
@@ -1036,11 +1181,6 @@ def _read_square(driver, ng_bind_fragment: str) -> str:
 
 
 def read_house_squares(driver) -> tuple:
-    """
-    Возвращает (p_total, p_residential) — строки или ''.
-    ВНИМАНИЕ: читать надо на СТРАНИЦЕ КАРТОЧКИ ДОМА
-    (/house-view?...), а не на "Информации об управлении МКД".
-    """
     p_total = _read_square(driver, "totalSquare")
     p_residential = _read_square(driver, "residentialSquare")
     return p_total, p_residential
@@ -1158,11 +1298,6 @@ def find_contract_actual_name(pairs: list):
     return a
 
 def collect_house_info(driver, p_total: str = "", p_residential: str = ""):
-    """
-    Собирает поля с "Информации об управлении МКД" (org, addr, pdf_name, date,
-    pdf_icons, pairs).
-    Площади приходят параметрами (их читают с карточки дома).
-    """
     info = {"org": "", "addr": "", "pdf_name": "", "date": "",
             "pdf_icons": -1, "pairs": [],
             "p_total": p_total, "p_residential": p_residential}
@@ -1373,7 +1508,6 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     if index >= len(links):
         return False
 
-    # --- открываем карточку дома (card_handle) ---
     card_handle = open_new_tab_and_switch(
         driver, wait,
         lambda: driver.execute_script(
@@ -1384,7 +1518,6 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     )
     time.sleep(2)
 
-    # --- читаем площади СРАЗУ, пока мы на карточке дома ---
     p_total, p_res = "", ""
     try:
         p_total, p_res = read_house_squares(driver)
@@ -1392,7 +1525,6 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     except Exception as e:
         log(f"    [squares] ошибка чтения: {e}")
 
-    # --- переходим на "Информацию об управлении МКД" (mgmt_handle) ---
     mgmt_link = wait.until(EC.presence_of_element_located(
         (By.XPATH, "//a[contains(., 'Информация об управлении МКД')]")
     ))
@@ -1539,6 +1671,11 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
             pdf, p7s = pairs[0]
 
     file_stem = pdf.stem
+    file_size = 0
+    try:
+        file_size = pdf.stat().st_size
+    except Exception:
+        pass
 
     try:
         with open(SEQ_LOG, "a", encoding="utf-8") as fh:
@@ -1608,13 +1745,14 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
         result_text = ""
         marker = None
 
-    # --- 4-й скриншот: первая страница PDF-договора ---
+    # --- 4-й скриншот: первая страница PDF или HTML-заглушка ---
     scr_pdf_first = None
     try:
         if pdf is not None and pdf.exists():
             scr_pdf_first = snapshot_pdf_first_page(
                 driver, pdf, file_stem,
-                f"{file_stem} | ДУ(У)={contract_date} | первая страница PDF"
+                file_size=file_size,
+                extra=f"{file_stem} | ДУ(У)={contract_date} | первая страница PDF"
             )
         else:
             log("    [pdf-snap] PDF недоступен — пропуск")
@@ -1654,7 +1792,6 @@ def process_one_house(driver, ufo_handle, gis_handle, index):
     except Exception as e:
         log(f"    [contract-log] error: {e}")
 
-    # --- Возврат на УФО ---
     if scr_pdf_first:
         try:
             driver.get(UFO_URL)
