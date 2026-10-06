@@ -5,55 +5,56 @@ make_report.py — генератор HTML-отчёта по проверке Э
 Источники (все читаются "склеенными"):
   1) %TEMP%\\IN\\LOG\\contracts*.log  — таблица нарушителей (Н / Ж)
                                         с 3 или 4 скриншотами на дом.
-  2) %TEMP%\\IN\\LOG\\gisjkh-ufo*.log — общий лог проверок, из него берём
-                                        знаменатель для расчёта уровня доверия:
-                                        сколько домов у каждой УК проверено,
-                                        сколько из них Д / Н / Ж.
+  2) %TEMP%\\IN\\LOG\\gisjkh-ufo*.log — общий лог проверок.
 
 Уровень доверия по УК = Д / (Д + Н + Ж) × 100%.
-    - 100% — все проверенные дома с действительной ЭП;
-    -   0% — ни одного Д (все Н или Ж).
 Цвет шрифта — по тепловой шкале (голубой → бордовый).
 
 Структура отчёта — дерево:
-    строка-УК (свёрнуто)
-      + раскрывающиеся строки-дома (по клику на '+')
+    строка-УК (свёрнуто) + раскрывающиеся строки-дома.
 
 Свёрнутая строка УК:
-    1) Организация + trust (как в развёрнутом)
-    2) Адрес — цифрой количество проверенных адресов
-    3) Дата ДУ — только если есть массовая дата (одна, максимальная по count)
-       + количество повторов + комментарий
-       "проверить кворумы МКД по бюллетеням и законность пролонгации"
-       Подсвечивается пастельным цветом по самой дате.
-    4) Результат ЭП — две цифры: Н (оранжевая), Ж (бордовая), через отступ
-    5) Протокол проверки — пусто
+    1) Организация + trust
+    2) Адрес: число адресов (слева) + сводка по отрицательным Δ (справа)
+    3) Дата ДУ — только если есть массовая дата
+    4) Результат ЭП — Н/Д + Н/Д, Н/В
+    5) Протокол — пусто
+
+Строка дома:
+    Адрес: адрес (слева) + отрицательная Δ красным (справа), если есть
+    Дата — красным, если выходной/праздник; пастельный фон, если массовая
+    Результат / Просмотр
 
 Сортировка: по trust ↑ (по возрастанию), tie — по имени УК.
-Массовые даты: у одной УК может быть несколько дат с ≥2 повторами.
-    В легенду/ячейку идёт ОДНА — с максимальным count.
-    Если несколько делят максимум — берётся первая по появлению.
-
-Слайдшоу: 3 или 4 кадра (по наличию 4-й строки в блоке дома).
-    - Пауза/продолжение: пробел или тап по экрану.
-    - Автозакрытие после последнего кадра.
-    - Правый клик / долгое нажатие — системное "Сохранить картинку как…".
-    - В подписи вместо имени PDF — "Для паузы нажми Пробел или тапни по экрану".
-
-После генерации: неиспользованные JPG → в корзину (send2trash),
-    но строка закомментирована до отладки основного функционала.
+Слайдшоу: 3 или 4 кадра. Пауза/продолжение: пробел или тап.
 """
 
 import re
 import json
+import shutil
+from datetime import date as _date
 from pathlib import Path
 from tempfile import gettempdir
+
+# ============================== ПРАЗДНИКИ ==============================
+try:
+    import holidays as _holidays
+    RU_HOLIDAYS = _holidays.RU(years=range(2000, 2032))
+    _HAS_HOLIDAYS = True
+except Exception as _e:
+    RU_HOLIDAYS = None
+    _HAS_HOLIDAYS = False
+    print(f"[!] holidays не установлен или ошибка: {_e}")
+    print("[i] будет учитываться только суббота/воскресенье")
 
 # ============================== ПУТИ ==============================
 BASE_DIR = Path(gettempdir()) / "IN"
 LOG_DIR = BASE_DIR / "LOG"
 JPG_DIR = BASE_DIR / "JPG"
 OUT_HTML = JPG_DIR / "report.html"
+
+# Куда сносить неиспользуемые JPG (вне report).
+TRASH_DIR = Path(r"D:\IN\OLD\JPG")
 
 # ============================== НАСТРОЙКИ ==============================
 MARKER_LONG = {
@@ -66,7 +67,6 @@ MASS_DATE_MIN = 2
 MASS_DATE_HINT = ("проверить кворумы МКД по бюллетеням "
                   "и законность пролонгации")
 
-
 # ============================== ПАРСИНГ contracts*.log ==============================
 RE_LINE1 = re.compile(
     r"^(scr\d{4}\.jpg)\s*-\s*(.+?)\s*--\s*(.+?)\s*---\s*(.+?)\s*----\s*(.+)$"
@@ -75,18 +75,87 @@ RE_LINE2 = re.compile(r"^(scr\d{4}\.jpg)\s*-\s*(.+?)\s*--\s*(.+)$")
 RE_LINE3 = re.compile(r"^(scr\d{4}\.jpg)\s*-\s*(.+)$")
 RE_LINE4_SCR = re.compile(r"^(scr\d{4}\.jpg)\s*$")
 
+RE_DELTA_VALUE = re.compile(r"=\s*(-?\d+(?:[.,]\d+)?)\s*$")
+RE_DATE_DDMMYYYY = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
+
 
 def _iter_contract_files():
     files = sorted(LOG_DIR.glob("contracts*.log"), key=lambda p: p.name)
     return files
 
 
+def _extract_delta_value(pdf_again: str):
+    """
+    pdf_again — то, что во второй строке между ' - ' и ' -- '
+    (например '(714.9)-720.3=-5.4' или 'dogmol2.pdf').
+    Возвращает float или None.
+    """
+    if not pdf_again:
+        return None
+    m = RE_DELTA_VALUE.search(pdf_again.strip())
+    if not m:
+        return None
+    try:
+        return float(m.group(1).replace(",", "."))
+    except Exception:
+        return None
+
+
+def _is_holiday(date_str: str) -> bool:
+    """
+    True, если дата 'dd.mm.yyyy' — суббота, воскресенье или
+    нерабочий праздничный/перенесённый день (по производственному
+    календарю РФ).
+    """
+    if not date_str:
+        return False
+    m = RE_DATE_DDMMYYYY.match(date_str.strip())
+    if not m:
+        return False
+    try:
+        d = _date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    except Exception:
+        return False
+
+    # Праздники (через библиотеку) — если есть
+    if _HAS_HOLIDAYS and RU_HOLIDAYS is not None:
+        try:
+            if d in RU_HOLIDAYS:
+                return True
+        except Exception:
+            pass
+
+    # Сб/Вс — всегда нерабочие (перенесённые рабочие субботы
+    # библиотека holidays тоже учитывает: если рабочая суббота
+    # объявлена рабочей, её нет в RU_HOLIDAYS — но weekday() == 5.
+    # Чтобы не подсвечивать рабочие субботы, проверяем:
+    #  - если в RU_HOLIDAYS — да;
+    #  - иначе, если это сб/вс и НЕ в списке рабочих суббот — да.
+    # Простой способ: сб/вс, кроме тех, что явно рабочие.
+    # В РФ перенесённые рабочие субботы объявляются постановлением.
+    # Библиотека holidays их не помечает как рабочие — их просто нет
+    # в списке праздников. Поэтому для сб/вс используем weekday,
+    # но исключаем те, что попадают в известные переносы.
+    if d.weekday() >= 5:
+        # Если в списке праздников — уже отдали True выше.
+        # Иначе — сб/вс; в большинстве случаев это выходной.
+        return True
+
+    return False
+
+
 def parse_contracts_logs():
     """
     Читает все contracts*.log и склеивает их в один список записей.
     Блок = 3 или 4 непустые строки, разделённые пустой строкой.
+
+    Дедупликация: если в разных файлах встречается один и тот же
+    дом (org + addr + date) — оставляем только первую запись.
+    Это спасает от двойного прогона одного и того же ОГРН.
     """
     records = []
+    seen_keys = set()
+
     for path in _iter_contract_files():
         text = path.read_text(encoding="utf-8")
         blocks = re.split(r"\r?\n\r?\n", text.strip())
@@ -116,6 +185,19 @@ def parse_contracts_logs():
                 if m4:
                     scr_pdf = m4.group(1)
 
+            delta_value = _extract_delta_value(_pdf_again)
+            hol = _is_holiday(date_str)
+
+            # --- дедупликация: один и тот же дом по (org, addr, date) ---
+            key = (
+                (org or "").strip().lower(),
+                (addr or "").strip().lower(),
+                (date_str or "").strip(),
+            )
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
             records.append({
                 "src": path.name,
                 "scr_a": scr_a,
@@ -129,9 +211,10 @@ def parse_contracts_logs():
                 "marker": marker,
                 "marker_long": MARKER_LONG.get(marker, marker),
                 "scr_pdf": scr_pdf,
+                "delta_value": delta_value,
+                "is_holiday": hol,
             })
     return records
-
 
 # ============================== ПАРСИНГ gisjkh-ufo*.log ==============================
 RE_HOUSE_INFO = re.compile(
@@ -148,17 +231,12 @@ RE_RESULT_NONE = re.compile(
     r"result_text:\s*'ДЕЙСТВИТЕЛЬНА'\s+marker:\s*None"
 )
 
-
 def _iter_gisjkh_files():
     files = sorted(LOG_DIR.glob("gisjkh-ufo*.log"), key=lambda p: p.name)
     return files
 
 
 def parse_gisjkh_logs():
-    """
-    Читает все gisjkh-ufo*.log и склеивает статистику по УК.
-    Возвращает: {org: {"total": N, "Д": n, "Н": n, "Ж": n}}
-    """
     stats = {}
     for path in _iter_gisjkh_files():
         current_org = None
@@ -190,20 +268,10 @@ def _bump(stats: dict, org: str, marker: str):
     stats[org]["total"] += 1
     stats[org][marker] = stats[org].get(marker, 0) + 1
 
-
 # ============================== МАССОВЫЕ ДАТЫ ==============================
 def compute_mass_date_per_org(records):
-    """
-    Для каждой УК:
-        - считаем количество каждой даты ДУ,
-        - оставляем только даты с count >= MASS_DATE_MIN,
-        - из них выбираем ОДНУ с максимальным count,
-          tie → первая по появлению в records.
-    Возвращает: {org: {"date": ..., "count": N}}
-    """
-    counts_per_org = {}   # org -> {date: count}
-    order_per_org = {}    # org -> [dates в порядке появления]
-
+    counts_per_org = {}
+    order_per_org = {}
     for r in records:
         org = r["org"]
         date = r["date"]
@@ -221,20 +289,14 @@ def compute_mass_date_per_org(records):
         if not mass:
             continue
         max_count = max(c for _, c in mass)
-        # первая по появлению среди дат с максимальным count
         for d in order_per_org[org]:
             if counts.get(d) == max_count and counts[d] >= MASS_DATE_MIN:
                 result[org] = {"date": d, "count": max_count}
                 break
     return result
 
-
 # ============================== СВОДКА ПО УК ==============================
 def compute_org_summary(records, org_stats, mass_per_org):
-    """
-    Для каждой УК — сводка для свёрнутой строки:
-      trust, addr_count, n_count, j_count, mass_date, mass_count
-    """
     summary = {}
     for r in records:
         org = r["org"]
@@ -247,6 +309,9 @@ def compute_org_summary(records, org_stats, mass_per_org):
                 "mass_date": "",
                 "mass_count": 0,
                 "trust": 0.0,
+                "neg_count": 0,
+                "neg_sum": 0.0,
+                "holiday_count": 0,
             }
         s = summary[org]
         s["addr_count"] += 1
@@ -254,6 +319,14 @@ def compute_org_summary(records, org_stats, mass_per_org):
             s["n_count"] += 1
         elif r["marker"] == "Ж":
             s["j_count"] += 1
+
+        dv = r.get("delta_value")
+        if dv is not None and dv < 0:
+            s["neg_count"] += 1
+            s["neg_sum"] += dv
+
+        if r.get("is_holiday"):
+            s["holiday_count"] += 1
 
     for org, s in summary.items():
         backend = org_stats.get(org)
@@ -269,7 +342,6 @@ def compute_org_summary(records, org_stats, mass_per_org):
             s["mass_count"] = mass["count"]
 
     return summary
-
 
 # ============================== HTML-ШАБЛОН ==============================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -295,7 +367,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   th.col-toggle { width: 28px; cursor: default; }
   th.col-toggle:hover { background: #eaeaea; }
 
-  /* строка-УК */
   tr.org-row td { background: #f3f3f3; font-weight: 600; }
   tr.org-row:hover td { background: #ececec; }
   tr.org-row td.org-cell { white-space: normal; }
@@ -322,15 +393,30 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       color: #555; margin-top: 2px;
   }
 
+  /* дата-выходной/праздник — красным */
+  td.holiday-date {
+      color: #b00; font-weight: bold;
+  }
+
   td.marker-zh  { color: #b00; font-weight: bold; }
   td.marker-n   { color: #d68000; font-weight: bold; }
   td.marker-other { color: #333; font-weight: bold; }
 
-  /* свёрнутая ячейка Н/Ж: две цифры */
   .n-counter { color: #d68000; font-weight: bold; }
   .j-counter { color: #b00; font-weight: bold; margin-left: 14px; }
 
-  /* строка-дом (скрытая по умолчанию) */
+  /* ячейка адреса с Δ справа */
+  td.addr-cell {
+      display: flex; justify-content: space-between;
+      align-items: flex-start; gap: 12px;
+  }
+  td.addr-cell .addr-text { flex: 1 1 auto; }
+  td.addr-cell .addr-delta {
+      flex: 0 0 auto; color: #b00; font-weight: bold;
+      font-variant-numeric: tabular-nums; white-space: nowrap;
+      text-align: right;
+  }
+
   tr.house-row { display: none; }
   tr.house-row.visible { display: table-row; }
   tr.house-row td.house-addr { padding-left: 32px; }
@@ -394,14 +480,24 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div class="meta">
   Записей: <span id="count">0</span>.
   <br>
-  <b>Уровень доверия</b> по УК = Д / (Д + Н + Ж) × 100%,
-  где Д — дома с действительной ЭП. Цвет — по тепловой шкале
+  <b>Уровень доверия</b> по УК = Д / (Д + Н/Д + Н/Д, Н/В) × 100%,
+  где Д — дома с действительной ЭП, Н/Д — подпись верна, но недействительна,
+  Н/Д, Н/В — подпись неверна и недействительна. Цвет — по тепловой шкале
   (голубой = высокий, бордовый = низкий).
   Сортировка по умолчанию — по уровню доверия <b>↑</b> (аутсайдеры сверху).
   <br>
   <b>Массовые даты</b> (у одной УК, ≥<span id="mass_min">2</span> раз)
   показаны в свёрнутой строке УК — берётся дата с максимальным
   числом повторов. Подсвечены пастельным цветом.
+  <br>
+  <b>Отрицательная площадь</b> (красным справа от адреса) —
+  разница между общей площадью дома и площадью жилых помещений,
+  если она получилась меньше нуля. Показывается как
+  <code>−N м<sup>2</sup></code> и только для таких домов.
+  <br>
+  <b>Красным шрифтом в ячейке даты</b> выделены даты заключения
+  договоров, приходящиеся на выходные или нерабочие праздничные
+  (перенесённые) дни.
 </div>
 
 <table id="tbl">
@@ -442,7 +538,6 @@ let sortAsc = true;
 let slideshowTimer = null;
 const FRAME_MS = 2000;
 
-/* --- глобальное состояние слайдшоу --- */
 let slideshowState = {
   imgs: [],
   cur: 0,
@@ -450,7 +545,6 @@ let slideshowState = {
   activeCount: 0,
 };
 
-/* какие УК сейчас раскрыты (чтобы не схлопывались при сортировке) */
 const expandedOrgs = new Set();
 
 function esc(s) {
@@ -459,18 +553,26 @@ function esc(s) {
   }[c]));
 }
 
-/* ---------- уровень доверия: цвет по шкале ---------- */
-function trustColor(trust) {
-  if (trust >= 99.5) return "hsl(200, 70%, 50%)"; // голубой
-  if (trust >= 81)   return "hsl(140, 60%, 40%)"; // зелёный
-  if (trust >= 61)   return "hsl(80, 65%, 40%)";  // жёлто-зелёный
-  if (trust >= 41)   return "hsl(50, 80%, 40%)";  // жёлтый
-  if (trust >= 21)   return "hsl(30, 85%, 45%)";  // оранжевый
-  if (trust >= 0.5)  return "hsl(10, 80%, 45%)";  // красный
-  return "hsl(350, 70%, 35%)";                    // бордовый
+function fmtNegDelta(v) {
+  if (v === null || v === undefined) return "";
+  if (!(v < 0)) return "";
+  var s = String(Math.abs(v));
+  if (s.indexOf(".") >= 0) {
+    s = s.replace(/0+$/, "").replace(/\.$/, "");
+  }
+  return "\u2212" + s + " м<sup>2</sup>";
 }
 
-/* ---------- пастельный цвет по строке даты ---------- */
+function trustColor(trust) {
+  if (trust >= 99.5) return "hsl(200, 70%, 50%)";
+  if (trust >= 81)   return "hsl(140, 60%, 40%)";
+  if (trust >= 61)   return "hsl(80, 65%, 40%)";
+  if (trust >= 41)   return "hsl(50, 80%, 40%)";
+  if (trust >= 21)   return "hsl(30, 85%, 45%)";
+  if (trust >= 0.5)  return "hsl(10, 80%, 45%)";
+  return "hsl(350, 70%, 35%)";
+}
+
 function hashCode(str) {
   let h = 0;
   for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
@@ -481,19 +583,10 @@ function pastelColorForDate(dateStr) {
   return "hsl(" + h + ", 50%, 92%)";
 }
 
-/* '27.02.2025' -> '2025-02-27' (для корректной сортировки по дате) */
-function dateKey(d) {
-  const m = (d || "").match(/^(\d{2})\.(\d{2})\.(\d{4})$/);
-  if (!m) return d || "";
-  return m[3] + "-" + m[2] + "-" + m[1];
-}
-
-/* ---------- рендер ---------- */
 function render() {
   const tbody = document.getElementById("tbody");
   tbody.innerHTML = "";
 
-  /* группируем дома по УК */
   const byOrg = {};
   DATA.forEach(r => {
     if (!byOrg[r.org]) byOrg[r.org] = [];
@@ -502,7 +595,6 @@ function render() {
 
   const orgs = Object.keys(byOrg);
 
-  /* сортировка по trust ↑, tie — по имени УК */
   orgs.sort((a, b) => {
     const ta = ORG_SUMMARY_BACKEND[a] ? ORG_SUMMARY_BACKEND[a].trust : 0;
     const tb = ORG_SUMMARY_BACKEND[b] ? ORG_SUMMARY_BACKEND[b].trust : 0;
@@ -514,15 +606,14 @@ function render() {
   orgs.forEach(org => {
     const s = ORG_SUMMARY_BACKEND[org] || {
       trust: 0, addr_count: 0, n_count: 0, j_count: 0,
-      mass_date: "", mass_count: 0
+      mass_date: "", mass_count: 0, neg_count: 0, neg_sum: 0,
+      holiday_count: 0
     };
     const color = trustColor(s.trust);
 
-    /* --- строка УК --- */
     const tr = document.createElement("tr");
     tr.className = "org-row";
 
-    /* ячейка 3: массовая дата */
     let dateCellHtml = "";
     if (s.mass_date) {
       const bg = pastelColorForDate(s.mass_date);
@@ -535,10 +626,22 @@ function render() {
       dateCellHtml = "<td></td>";
     }
 
-    /* ячейка 4: Н (оранж) + Ж (бордо) */
-    const nHtml = "<span class='n-counter'>Н: " + s.n_count + "</span>";
-    const jHtml = "<span class='j-counter'>Ж: " + s.j_count + "</span>";
+    /* Н/Д + Н/Д, Н/В */
+    const nHtml = "<span class='n-counter'>Н/Д: " + s.n_count + "</span>";
+    const jHtml = "<span class='j-counter'>Н/Д, Н/В: " + s.j_count + "</span>";
     const markerCellHtml = "<td>" + nHtml + jHtml + "</td>";
+
+    let addrCellHtml;
+    if (s.neg_count > 0) {
+      const sumTxt = fmtNegDelta(s.neg_sum);
+      addrCellHtml =
+        "<td class='addr-cell'>" +
+          "<span class='addr-text'>" + s.addr_count + " адр.</span>" +
+          "<span class='addr-delta'>" + sumTxt + "</span>" +
+        "</td>";
+    } else {
+      addrCellHtml = "<td>" + s.addr_count + "</td>";
+    }
 
     tr.innerHTML =
       "<td class='toggle-cell'>+</td>" +
@@ -548,34 +651,29 @@ function render() {
           s.trust.toFixed(0) + "%" +
         "</span>" +
       "</td>" +
-      "<td>" + s.addr_count + "</td>" +
+      addrCellHtml +
       dateCellHtml +
       markerCellHtml +
       "<td></td>";
 
     tbody.appendChild(tr);
 
-    /* --- строки домов (скрытые или уже раскрытые) --- */
     const isOpen = expandedOrgs.has(org);
     const houseRows = [];
 
-    /* сортируем дома внутри УК по тому же ключу, что и УК */
     const houseList = byOrg[org].slice();
     houseList.sort((a, b) => {
       let va, vb;
       if (sortKey === "trust") {
-        va = dateKey(a.date);
-        vb = dateKey(b.date);
+        va = (a.date || "").toLowerCase();
+        vb = (b.date || "").toLowerCase();
       } else if (sortKey === "marker") {
         va = (a.marker || "").toLowerCase();
         vb = (b.marker || "").toLowerCase();
         if (va === vb) {
-          va = dateKey(a.date);
-          vb = dateKey(b.date);
+          va = (a.date || "").toLowerCase();
+          vb = (b.date || "").toLowerCase();
         }
-      } else if (sortKey === "date") {
-        va = dateKey(a.date);
-        vb = dateKey(b.date);
       } else {
         va = (a[sortKey] ?? "").toString().toLowerCase();
         vb = (b[sortKey] ?? "").toString().toLowerCase();
@@ -590,17 +688,39 @@ function render() {
                        : r.marker === "Н" ? "marker-n"
                        : "marker-other";
       const mass = (s.mass_date && r.date === s.mass_date);
+
+      /* дата: пастельный фон (если массовая) + красный шрифт (если выходной) */
+      const dateClasses = [];
+      if (mass) dateClasses.push("mass-date");
+      if (r.is_holiday) dateClasses.push("holiday-date");
+      const dateClass = dateClasses.length
+        ? " class='" + dateClasses.join(" ") + "'"
+        : "";
       const dateStyle = mass
         ? " style='background:" + pastelColorForDate(r.date) + "'"
         : "";
-      const dateClass = mass ? " class='mass-date'" : "";
+
+      let addrCell;
+      const dv = (r.delta_value === null || r.delta_value === undefined)
+        ? null : r.delta_value;
+      const deltaTxt = (dv !== null && dv < 0) ? fmtNegDelta(dv) : "";
+      if (deltaTxt) {
+        addrCell =
+          "<td class='addr-cell house-addr'>" +
+            "<span class='addr-text'>" + esc(r.addr) + "</span>" +
+            "<span class='addr-delta'>" + deltaTxt + "</span>" +
+          "</td>";
+      } else {
+        addrCell =
+          "<td class='house-addr'>" + esc(r.addr) + "</td>";
+      }
 
       const htr = document.createElement("tr");
       htr.className = "house-row" + (isOpen ? " visible" : "");
       htr.innerHTML =
         "<td></td>" +
         "<td></td>" +
-        "<td class='house-addr'>" + esc(r.addr) + "</td>" +
+        addrCell +
         "<td" + dateClass + dateStyle + ">" + esc(r.date) + "</td>" +
         "<td class='" + markerCls + "'>" + esc(r.marker_long) + "</td>" +
         "<td><span class='btn-view'>Смотреть</span></td>";
@@ -615,7 +735,6 @@ function render() {
       houseRows.push(htr);
     });
 
-    /* --- toggle --- */
     const toggle = tr.querySelector(".toggle-cell");
     toggle.textContent = isOpen ? "−" : "+";
     toggle.addEventListener("click", () => {
@@ -633,7 +752,6 @@ function render() {
   document.getElementById("count").textContent = DATA.length;
 }
 
-/* ---------- слайдшоу ---------- */
 function openOverlay(record) {
   const ov = document.getElementById("overlay");
   const imgs = [
@@ -643,8 +761,6 @@ function openOverlay(record) {
     document.getElementById("ov_img3"),
   ];
 
-  /* собираем список доступных скринов:
-     3 базовых + опционально 4-й (scr_pdf) */
   const srcs = [record.scr_a, record.scr_b, record.scr_c];
   if (record.scr_pdf) srcs.push(record.scr_pdf);
 
@@ -708,7 +824,6 @@ function closeOverlay() {
   slideshowState.activeCount = 0;
 }
 
-/* пробел → пауза/продолжить */
 document.addEventListener("keydown", e => {
   if (e.key === "Escape") {
     closeOverlay();
@@ -723,7 +838,6 @@ document.addEventListener("keydown", e => {
   }
 });
 
-/* клик вне кадра → закрыть; клик по кадру → пауза/продолжить */
 document.getElementById("overlay").addEventListener("click", e => {
   const ov = document.getElementById("overlay");
   if (!ov.classList.contains("open")) return;
@@ -739,13 +853,10 @@ document.getElementById("overlay").addEventListener("click", e => {
   }
 });
 
-/* --- контекстное меню: не мешаем браузеру "Сохранить картинку как…" --- */
 document.getElementById("overlay").addEventListener("contextmenu", e => {
-  /* никаких preventDefault: даём системное меню */
   return true;
 });
 
-/* сортировка по клику на заголовок */
 document.querySelectorAll("th[data-key]").forEach(th => {
   th.addEventListener("click", () => {
     const key = th.dataset.key;
@@ -763,7 +874,6 @@ document.querySelectorAll("th[data-key]").forEach(th => {
 
 document.getElementById("mass_min").textContent = MASS_DATE_MIN;
 
-/* --- кнопка «Развернуть/Свернуть все» --- */
 document.getElementById("btn-expand-all").addEventListener("click", () => {
   const btn = document.getElementById("btn-expand-all");
   const allOrgs = new Set(DATA.map(r => r.org));
@@ -785,14 +895,12 @@ render();
 </html>
 """
 
-
-# ============================== КОРЗИНА ==============================
+# ============================== ОЧИСТКА JPG ==============================
 def trash_unused_jpgs(records):
     """
     Найти все scrNNNN.jpg, использованные в contracts*.log.
     Найти все *.jpg в JPG_DIR, которых там нет.
-    Переместить их в корзину (send2trash).
-    СТРОКА С send2trash ЗАКОММЕНТИРОВАНА до полной отладки.
+    Переместить их в TRASH_DIR (D:\\IN\\OLD\\JPG\\).
     """
     used = set()
     for r in records:
@@ -813,19 +921,41 @@ def trash_unused_jpgs(records):
     if not unused:
         return
 
-    # --- раскомментировать после отладки ---
-    # try:
-    #     from send2trash import send2trash
-    #     for p in unused:
-    #         send2trash(str(p))
-    #     print(f"[+] перемещено в корзину: {len(unused)}")
-    # except ImportError:
-    #     print("[!] send2trash не установлен — пропуск")
-    # except Exception as e:
-    #     print(f"[!] ошибка корзины: {e}")
+    try:
+        TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[!] не удалось создать {TRASH_DIR}: {e}")
+        return
 
-    print("[i] корзина отключена (строка закомментирована) — пропуск")
+    moved = 0
+    skipped_exists = 0
+    skipped_missing = 0
+    errors = 0
 
+    for p in unused:
+        try:
+            if not p.exists():
+                skipped_missing += 1
+                continue
+
+            target = TRASH_DIR / p.name
+            if target.exists():
+                skipped_exists += 1
+                continue
+
+            shutil.move(str(p), str(target))
+            moved += 1
+        except Exception as e:
+            errors += 1
+            print(f"    [!] {p.name}: {e}")
+
+    print(f"[+] перемещено в {TRASH_DIR}: {moved}")
+    if skipped_exists:
+        print(f"[i] уже было в TRASH_DIR: {skipped_exists}")
+    if skipped_missing:
+        print(f"[i] не найдено (уже перенесено/удалено): {skipped_missing}")
+    if errors:
+        print(f"[!] ошибок: {errors}")
 
 # ============================== MAIN ==============================
 def main():
@@ -848,13 +978,22 @@ def main():
 
     org_summary = compute_org_summary(records, org_stats, mass_per_org)
 
-    # --- отладочный вывод топа по trust ---
+    total_neg = sum(1 for r in records
+                    if r.get("delta_value") is not None
+                    and r["delta_value"] < 0)
+    print(f"[+] домов с отрицательной дельтой (Δ<0): {total_neg}")
+
+    total_hol = sum(1 for r in records if r.get("is_holiday"))
+    print(f"[+] домов с датой ДУ в выходной/праздник: {total_hol}")
+
     print(f"[+] сводка по УК (top-10 по trust ↑):")
     for org, s in sorted(org_summary.items(),
                          key=lambda kv: kv[1]["trust"])[:10]:
         print(f"    {org[:50]:50s}  trust={s['trust']:5.1f}%  "
               f"addr={s['addr_count']:3d}  "
               f"Н={s['n_count']:3d}  Ж={s['j_count']:3d}  "
+              f"Δ<0: n={s['neg_count']:3d} sum={s['neg_sum']:>10.1f}  "
+              f"hol={s['holiday_count']:3d}  "
               f"mass={s['mass_date'] or '-'}")
 
     data_js = json.dumps(records, ensure_ascii=False)
@@ -875,7 +1014,6 @@ def main():
     print(f"[+] records: {len(records)}")
 
     trash_unused_jpgs(records)
-
 
 if __name__ == "__main__":
     main()
