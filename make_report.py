@@ -169,6 +169,12 @@ def parse_contracts_logs():
                 continue
             scr_a, org, addr, pdf_name, date_str = m1.groups()
 
+            # Отсеиваем мусорные записи, где вместо УК попал заголовок
+            # "Адрес дома:" или пустое значение.
+            org_clean = (org or "").strip()
+            if (not org_clean) or (org_clean == "Адрес дома:"):
+                continue
+
             m2 = RE_LINE2.match(lines[1].strip())
             if not m2:
                 continue
@@ -486,7 +492,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   (голубой = высокий, бордовый = низкий).
   Сортировка по умолчанию — по уровню доверия <b>↑</b> (аутсайдеры сверху).
   <br>
-  <b>Массовые даты</b> (у одной УК, ≥<span id="mass_min">2</span> раз)
+  <b>Массовые одинаковые даты заключения договоров</b> (у одной УК, ≥<span id="mass_min">2</span> раз)
   показаны в свёрнутой строке УК — берётся дата с максимальным
   числом повторов. Подсвечены пастельным цветом.
   <br>
