@@ -2,31 +2,8 @@
 """
 make_report.py — генератор HTML-отчёта по проверке ЭП договоров УК.
 
-Источники (все читаются "склеенными"):
-  1) %TEMP%\\IN\\LOG\\contracts*.log  — таблица нарушителей (Н / Ж)
-                                        с 3 или 4 скриншотами на дом.
-  2) %TEMP%\\IN\\LOG\\gisjkh-ufo*.log — общий лог проверок.
-
-Уровень доверия по УК = Д / (Д + Н + Ж) × 100%.
-Цвет шрифта — по тепловой шкале (голубой → бордовый).
-
-Структура отчёта — дерево:
-    строка-УК (свёрнуто) + раскрывающиеся строки-дома.
-
-Свёрнутая строка УК:
-    1) Организация + trust
-    2) Адрес: число адресов (слева) + сводка по отрицательным Δ (справа)
-    3) Дата ДУ — только если есть массовая дата
-    4) Результат ЭП — Н/Д + Н/Д, Н/В
-    5) Протокол — пусто
-
-Строка дома:
-    Адрес: адрес (слева) + отрицательная Δ красным (справа), если есть
-    Дата — красным, если выходной/праздник; пастельный фон, если массовая
-    Результат / Просмотр
-
-Сортировка: по trust ↑ (по возрастанию), tie — по имени УК.
-Слайдшоу: 3 или 4 кадра. Пауза/продолжение: пробел или тап.
+Правка 9: RE_LINE2 допускает отсутствие pdf_again во 2-й строке блока.
+          Формат: "scrNNNN.jpg - pdf_again -- ep_name" ИЛИ "scrNNNN.jpg - ep_name".
 """
 
 import re
@@ -53,14 +30,14 @@ LOG_DIR = BASE_DIR / "LOG"
 JPG_DIR = BASE_DIR / "JPG"
 OUT_HTML = JPG_DIR / "report.html"
 
-# Куда сносить неиспользуемые JPG (вне report).
 TRASH_DIR = Path(r"D:\IN\OLD\JPG")
 
 # ============================== НАСТРОЙКИ ==============================
 MARKER_LONG = {
     "Н": "Подпись верна, но НЕДЕЙСТВИТЕЛЬНА",
     "Ж": "Подпись НЕВЕРНА и НЕДЕЙСТВИТЕЛЬНА",
-    "Д": "Подпись ДЕЙСТВИТЕЛЬНА",
+    "Э": "Подпись ОТСУТСТВУЕТ",
+    "О": "Информация о договоре НЕ РАЗМЕЩЕНА",
 }
 
 MASS_DATE_MIN = 2
@@ -68,28 +45,30 @@ MASS_DATE_HINT = ("проверить кворумы МКД по бюллете�
                   "и законность пролонгации")
 
 # ============================== ПАРСИНГ contracts*.log ==============================
+RE_SCR = r"scr(?:\d{4,}|XXXX)\.jpg"
 RE_LINE1 = re.compile(
-    r"^(scr\d{4}\.jpg)\s*-\s*(.+?)\s*--\s*(.+?)\s*---\s*(.+?)\s*----\s*(.+)$"
+    r"^(" + RE_SCR + r")\s*-\s*(.+?)\s*--\s*(.+?)\s*---\s*(.+?)\s*----\s*(.+)$"
 )
-RE_LINE2 = re.compile(r"^(scr\d{4}\.jpg)\s*-\s*(.+?)\s*--\s*(.+)$")
-RE_LINE3 = re.compile(r"^(scr\d{4}\.jpg)\s*-\s*(.+)$")
-RE_LINE4_SCR = re.compile(r"^(scr\d{4}\.jpg)\s*$")
+# Правка 9: pdf_again опционально.
+RE_LINE2 = re.compile(r"^(" + RE_SCR + r")\s*-\s*(?:(.+?)\s*--\s*)?(.+)$")
+RE_LINE3 = re.compile(r"^(" + RE_SCR + r")\s*-\s*(.+)$")
+RE_LINE4_SCR = re.compile(r"^(" + RE_SCR + r")\s*$")
 
 RE_DELTA_VALUE = re.compile(r"=\s*(-?\d+(?:[.,]\d+)?)\s*$")
 RE_DATE_DDMMYYYY = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
+RE_FILENAME_OGRN = re.compile(r"^contracts(\d{10,})\.log$")
 
 
 def _iter_contract_files():
-    files = sorted(LOG_DIR.glob("contracts*.log"), key=lambda p: p.name)
-    return files
+    return sorted(LOG_DIR.glob("contracts*.log"), key=lambda p: p.name)
+
+
+def _extract_ogrn(filename: str) -> str:
+    m = RE_FILENAME_OGRN.match(filename)
+    return m.group(1) if m else ""
 
 
 def _extract_delta_value(pdf_again: str):
-    """
-    pdf_again — то, что во второй строке между ' - ' и ' -- '
-    (например '(714.9)-720.3=-5.4' или 'dogmol2.pdf').
-    Возвращает float или None.
-    """
     if not pdf_again:
         return None
     m = RE_DELTA_VALUE.search(pdf_again.strip())
@@ -102,11 +81,6 @@ def _extract_delta_value(pdf_again: str):
 
 
 def _is_holiday(date_str: str) -> bool:
-    """
-    True, если дата 'dd.mm.yyyy' — суббота, воскресенье или
-    нерабочий праздничный/перенесённый день (по производственному
-    календарю РФ).
-    """
     if not date_str:
         return False
     m = RE_DATE_DDMMYYYY.match(date_str.strip())
@@ -117,7 +91,6 @@ def _is_holiday(date_str: str) -> bool:
     except Exception:
         return False
 
-    # Праздники (через библиотеку) — если есть
     if _HAS_HOLIDAYS and RU_HOLIDAYS is not None:
         try:
             if d in RU_HOLIDAYS:
@@ -125,43 +98,29 @@ def _is_holiday(date_str: str) -> bool:
         except Exception:
             pass
 
-    # Сб/Вс — всегда нерабочие (перенесённые рабочие субботы
-    # библиотека holidays тоже учитывает: если рабочая суббота
-    # объявлена рабочей, её нет в RU_HOLIDAYS — но weekday() == 5.
-    # Чтобы не подсвечивать рабочие субботы, проверяем:
-    #  - если в RU_HOLIDAYS — да;
-    #  - иначе, если это сб/вс и НЕ в списке рабочих суббот — да.
-    # Простой способ: сб/вс, кроме тех, что явно рабочие.
-    # В РФ перенесённые рабочие субботы объявляются постановлением.
-    # Библиотека holidays их не помечает как рабочие — их просто нет
-    # в списке праздников. Поэтому для сб/вс используем weekday,
-    # но исключаем те, что попадают в известные переносы.
     if d.weekday() >= 5:
-        # Если в списке праздников — уже отдали True выше.
-        # Иначе — сб/вс; в большинстве случаев это выходной.
         return True
 
     return False
 
 
-def parse_contracts_logs():
-    """
-    Читает все contracts*.log и склеивает их в один список записей.
-    Блок = 3 или 4 непустые строки, разделённые пустой строкой.
+def _is_real_scr(name: str) -> bool:
+    if not name:
+        return False
+    return bool(re.match(r"^scr\d{4,}\.jpg$", name))
 
-    Дедупликация: если в разных файлах встречается один и тот же
-    дом (org + addr + date) — оставляем только первую запись.
-    Это спасает от двойного прогона одного и того же ОГРН.
-    """
+
+def parse_contracts_logs():
     records = []
     seen_keys = set()
 
     for path in _iter_contract_files():
+        ogrn = _extract_ogrn(path.name)
         text = path.read_text(encoding="utf-8")
         blocks = re.split(r"\r?\n\r?\n", text.strip())
         for block in blocks:
             lines = [ln.rstrip() for ln in block.splitlines() if ln.strip()]
-            if len(lines) not in (3, 4):
+            if len(lines) < 3:
                 continue
 
             m1 = RE_LINE1.match(lines[0].strip())
@@ -169,36 +128,39 @@ def parse_contracts_logs():
                 continue
             scr_a, org, addr, pdf_name, date_str = m1.groups()
 
-            # Отсеиваем мусорные записи, где вместо УК попал заголовок
-            # "Адрес дома:" или пустое значение.
             org_clean = (org or "").strip()
             if (not org_clean) or (org_clean == "Адрес дома:"):
                 continue
+            org = org_clean.upper()
 
             m2 = RE_LINE2.match(lines[1].strip())
             if not m2:
                 continue
-            scr_b, _pdf_again, ep_name = m2.groups()
+            scr_b = m2.group(1)
+            _pdf_again = m2.group(2) or ""   # pdf_again опционален
+            ep_name = m2.group(3)
 
             m3 = RE_LINE3.match(lines[2].strip())
             if not m3:
                 continue
             scr_c, marker = m3.groups()
 
-            scr_pdf = ""
-            if len(lines) == 4:
-                m4 = RE_LINE4_SCR.match(lines[3].strip())
-                if m4:
-                    scr_pdf = m4.group(1)
+            screens = [scr_a, scr_b, scr_c]
+            for ln in lines[3:]:
+                m = RE_LINE4_SCR.match(ln.strip())
+                if m:
+                    screens.append(m.group(1))
+
+            has_real_screens = any(_is_real_scr(s) for s in screens)
 
             delta_value = _extract_delta_value(_pdf_again)
+            if delta_value is not None:
+                delta_value = round(delta_value, 2)
             hol = _is_holiday(date_str)
 
-            # --- дедупликация: один и тот же дом по (org, addr, date) ---
             key = (
                 (org or "").strip().lower(),
                 (addr or "").strip().lower(),
-                (date_str or "").strip(),
             )
             if key in seen_keys:
                 continue
@@ -206,6 +168,7 @@ def parse_contracts_logs():
 
             records.append({
                 "src": path.name,
+                "ogrn": ogrn,
                 "scr_a": scr_a,
                 "org": org,
                 "addr": addr,
@@ -216,7 +179,9 @@ def parse_contracts_logs():
                 "scr_c": scr_c,
                 "marker": marker,
                 "marker_long": MARKER_LONG.get(marker, marker),
-                "scr_pdf": scr_pdf,
+                "screens": screens,
+                "has_real_screens": has_real_screens,
+                "scr_pdf": screens[3] if len(screens) > 3 else "",
                 "delta_value": delta_value,
                 "is_holiday": hol,
             })
@@ -238,8 +203,7 @@ RE_RESULT_NONE = re.compile(
 )
 
 def _iter_gisjkh_files():
-    files = sorted(LOG_DIR.glob("gisjkh-ufo*.log"), key=lambda p: p.name)
-    return files
+    return sorted(LOG_DIR.glob("gisjkh-ufo*.log"), key=lambda p: p.name)
 
 
 def parse_gisjkh_logs():
@@ -250,7 +214,7 @@ def parse_gisjkh_logs():
             for line in fh:
                 m_hi = RE_HOUSE_INFO.search(line)
                 if m_hi:
-                    current_org = m_hi.group(1).strip()
+                    current_org = m_hi.group(1).strip().upper()
                     continue
 
                 m_res = RE_RESULT_MARKER.search(line)
@@ -280,7 +244,9 @@ def compute_mass_date_per_org(records):
     order_per_org = {}
     for r in records:
         org = r["org"]
-        date = r["date"]
+        date = (r["date"] or "").strip()
+        if not RE_DATE_DDMMYYYY.match(date):
+            continue
         if org not in counts_per_org:
             counts_per_org[org] = {}
             order_per_org[org] = []
@@ -312,12 +278,15 @@ def compute_org_summary(records, org_stats, mass_per_org):
                 "addr_count": 0,
                 "n_count": 0,
                 "j_count": 0,
+                "e_count": 0,
+                "o_count": 0,
                 "mass_date": "",
                 "mass_count": 0,
                 "trust": 0.0,
                 "neg_count": 0,
                 "neg_sum": 0.0,
                 "holiday_count": 0,
+                "ogrns": [],
             }
         s = summary[org]
         s["addr_count"] += 1
@@ -325,6 +294,14 @@ def compute_org_summary(records, org_stats, mass_per_org):
             s["n_count"] += 1
         elif r["marker"] == "Ж":
             s["j_count"] += 1
+        elif r["marker"] == "Э":
+            s["e_count"] += 1
+        elif r["marker"] == "О":
+            s["o_count"] += 1
+
+        ogrn = r.get("ogrn") or ""
+        if ogrn and ogrn not in s["ogrns"]:
+            s["ogrns"].append(ogrn)
 
         dv = r.get("delta_value")
         if dv is not None and dv < 0:
@@ -336,16 +313,23 @@ def compute_org_summary(records, org_stats, mass_per_org):
 
     for org, s in summary.items():
         backend = org_stats.get(org)
-        if backend and backend.get("total", 0) > 0:
-            d = backend.get("Д", 0)
-            s["trust"] = d / backend["total"] * 100
+        d = backend.get("Д", 0) if backend else 0
+
+        numerator = d
+        denominator = d + s["n_count"] + s["j_count"] + s["e_count"] + s["o_count"]
+        if denominator > 0:
+            s["trust"] = round(numerator / denominator * 100, 1)
         else:
             s["trust"] = 0.0
+
+        s["neg_sum"] = round(s["neg_sum"], 2)
 
         mass = mass_per_org.get(org)
         if mass:
             s["mass_date"] = mass["date"]
             s["mass_count"] = mass["count"]
+
+        s["ogrns"] = sorted(s["ogrns"])[:1]
 
     return summary
 
@@ -354,12 +338,16 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Отчёт по проверке ЭП договоров УК</title>
+<title>Отчёт по проверке квалифицированной ЭП договоров УК</title>
 <style>
   body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
          margin: 20px; background: #f5f5f5; color: #222; }
   h1 { font-size: 20px; margin-bottom: 10px; }
   .meta { color: #666; font-size: 13px; margin-bottom: 16px; line-height: 1.5; }
+  .legal { color: #444; font-size: 12px; margin-top: 24px; line-height: 1.55;
+           border-top: 1px solid #ddd; padding-top: 12px; }
+  .legal h2 { font-size: 14px; margin: 0 0 8px 0; }
+  .legal ul { margin: 0 0 8px 0; padding-left: 20px; }
   table { border-collapse: collapse; background: #fff; width: 100%;
           box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
   th, td { border: 1px solid #ddd; padding: 6px 8px; font-size: 13px;
@@ -380,6 +368,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   td.org-cell .org-name {
       display: block; text-align: left; font-weight: 600;
   }
+  td.org-cell .org-ogrn {
+      display: block; text-align: left; font-weight: 400;
+      color: #555; font-size: 11px;
+      font-variant-numeric: tabular-nums;
+      margin-top: 2px;
+  }
   td.org-cell .org-score {
       display: block; text-align: right; font-weight: 700;
       font-variant-numeric: tabular-nums;
@@ -399,7 +393,6 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       color: #555; margin-top: 2px;
   }
 
-  /* дата-выходной/праздник — красным */
   td.holiday-date {
       color: #b00; font-weight: bold;
   }
@@ -410,8 +403,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   .n-counter { color: #d68000; font-weight: bold; }
   .j-counter { color: #b00; font-weight: bold; margin-left: 14px; }
+  .e-counter { color: #333; font-weight: bold; margin-left: 14px; }
+  .o-counter { color: #333; font-weight: bold; margin-left: 14px; }
 
-  /* ячейка адреса с Δ справа */
   td.addr-cell {
       display: flex; justify-content: space-between;
       align-items: flex-start; gap: 12px;
@@ -475,7 +469,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Отчёт по проверке квалифицированной ЭП договоров УК</h1>
+<h1>Отчёт по проверке квалифицированной Электронной Подписи договоров Управляющих Компаний</h1>
 <div style="margin-bottom:8px;">
   <button id="btn-expand-all" style="
       padding: 6px 14px; cursor: pointer;
@@ -486,15 +480,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <div class="meta">
   Записей: <span id="count">0</span>.
   <br>
-  <b>Уровень доверия</b> по УК = Д / (Д + Н/Д + Н/Д, Н/В) × 100%,
-  где Д — дома с действительной ЭП, Н/Д — подпись верна, но недействительна,
-  Н/Д, Н/В — подпись неверна и недействительна. Цвет — по тепловой шкале
-  (голубой = высокий, бордовый = низкий).
+  <b>Расшифровка маркеров столбца «Результат проверки ЭП»:</b>
+  <b>Н/Д</b> — подпись верна, но НЕДЕЙСТВИТЕЛЬНА;
+  <b>Н/В</b> — подпись НЕВЕРНА и НЕДЕЙСТВИТЕЛЬНА;
+  <b>Н/Э</b> — подпись ОТСУТСТВУЕТ;
+  <b>Н/О</b> — информация о договоре НЕ РАЗМЕЩЕНА.
+  В отчёт не попадает только Д (подпись ДЕЙСТВИТЕЛЬНА) — Д идёт
+  исключительно в статистику уровня доверия.
+  <br>
+  <b>Уровень доверия</b> по УК = Д / (Д + Н/Д + Н/В + Н/Э + Н/О) × 100%,
+  где Д — дома с действительной ЭП, остальные — из расшифровки выше.
+  Цвет — по тепловой шкале (голубой = высокий, бордовый = низкий).
   Сортировка по умолчанию — по уровню доверия <b>↑</b> (аутсайдеры сверху).
   <br>
   <b>Массовые одинаковые даты заключения договоров</b> (у одной УК, ≥<span id="mass_min">2</span> раз)
   показаны в свёрнутой строке УК — берётся дата с максимальным
-  числом повторов. Подсвечены пастельным цветом.
+  числом повторов. Подсвечены пастельным цветом. Строки «Дата отсутствует»
+  и прочие не-даты в подсчёт не входят.
   <br>
   <b>Отрицательная площадь</b> (красным справа от адреса) —
   разница между общей площадью дома и площадью жилых помещений,
@@ -504,6 +506,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <b>Красным шрифтом в ячейке даты</b> выделены даты заключения
   договоров, приходящиеся на выходные или нерабочие праздничные
   (перенесённые) дни.
+  <br>
+  <b>Констатация ОГРН.</b> ОГРН, указанный рядом с наименованием
+  организации, — это тот ОГРН, по которому производился поиск
+  в ГИС ЖКХ, а не утверждение соответствия данного ЮЛ этому ОГРН.
+  ГИС ЖКХ в отдельных случаях может отдавать по одному ОГРН карточки,
+  ссылающиеся на другое ЮЛ. Мы констатируем результат, полученный
+  от ГИС ЖКХ на момент прогона.
 </div>
 
 <table id="tbl">
@@ -520,8 +529,45 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <tbody id="tbody"></tbody>
 </table>
 
+<div class="legal">
+  <h2>Дисклеймер</h2>
+  <p>
+    Отчёт сформирован автоматически по результатам программного опроса
+    открытых источников — портала ГИС ЖКХ. Единственный источник данных —
+    ГИС ЖКХ на момент прогона. Отчёт не является юридическим заключением
+    и не заменяет собой проверку, проводимую уполномоченными органами.
+  </p>
+
+  <h2>Возможные правовые последствия выявленных фактов (справочно)</h2>
+  <p>
+    Ниже перечислены нормы, сопоставимые с описанными ситуациями.
+    Формулировки даны в осторожном ключе: факт может содержать признаки
+    соответствующего состава, что устанавливается компетентным органом.
+  </p>
+  <ul>
+    <li>ст. 159, 159.2 УК РФ — мошенничество, в том числе при получении
+        выплат;</li>
+    <li>ст. 272 УК РФ — неправомерный доступ к компьютерной информации;</li>
+    <li>ст. 327 УК РФ — подделка, изготовление или оборот поддельных
+        документов;</li>
+    <li>ст. 20.4 КоАП РФ — нарушение требований пожарной безопасности
+        (в части сопутствующих нарушений);</li>
+    <li>Федеральный закон № 63-ФЗ «Об электронной подписи» — требования
+        к квалифицированной электронной подписи;</li>
+    <li>Постановление Правительства РФ № 491 — Правила содержания общего
+        имущества;</li>
+    <li>Постановление Правительства РФ № 354 — Правила предоставления
+        коммунальных услуг;</li>
+    <li>Жилищный кодекс РФ — требования к раскрытию информации
+        управляющими организациями;</li>
+    <li>ч. 4 ст. 29 Конституции РФ — длящийся ущерб неимущественному
+        праву неопределённого круга лиц на доступ к объективной
+        информации.</li>
+  </ul>
+</div>
+
 <div id="overlay">
-  <div class="frame">
+  <div class="frame" id="ov_frame">
     <div class="close" onclick="closeOverlay()">×</div>
     <div class="paused-badge">ПАУЗА</div>
     <img id="ov_img0" alt="">
@@ -562,7 +608,7 @@ function esc(s) {
 function fmtNegDelta(v) {
   if (v === null || v === undefined) return "";
   if (!(v < 0)) return "";
-  var s = String(Math.abs(v));
+  var s = Math.abs(v).toFixed(2);
   if (s.indexOf(".") >= 0) {
     s = s.replace(/0+$/, "").replace(/\.$/, "");
   }
@@ -612,8 +658,9 @@ function render() {
   orgs.forEach(org => {
     const s = ORG_SUMMARY_BACKEND[org] || {
       trust: 0, addr_count: 0, n_count: 0, j_count: 0,
+      e_count: 0, o_count: 0,
       mass_date: "", mass_count: 0, neg_count: 0, neg_sum: 0,
-      holiday_count: 0
+      holiday_count: 0, ogrns: []
     };
     const color = trustColor(s.trust);
 
@@ -632,27 +679,35 @@ function render() {
       dateCellHtml = "<td></td>";
     }
 
-    /* Н/Д + Н/Д, Н/В */
-    const nHtml = "<span class='n-counter'>Н/Д: " + s.n_count + "</span>";
-    const jHtml = "<span class='j-counter'>Н/Д, Н/В: " + s.j_count + "</span>";
-    const markerCellHtml = "<td>" + nHtml + jHtml + "</td>";
+    let counters = [];
+    if (s.n_count > 0) counters.push("<span class='n-counter'>Н/Д: " + s.n_count + "</span>");
+    if (s.j_count > 0) counters.push("<span class='j-counter'>Н/В: " + s.j_count + "</span>");
+    if (s.e_count > 0) counters.push("<span class='e-counter'>Н/Э: " + s.e_count + "</span>");
+    if (s.o_count > 0) counters.push("<span class='o-counter'>Н/О: " + s.o_count + "</span>");
+    const markerCellHtml = "<td>" + counters.join("") + "</td>";
 
     let addrCellHtml;
     if (s.neg_count > 0) {
       const sumTxt = fmtNegDelta(s.neg_sum);
       addrCellHtml =
         "<td class='addr-cell'>" +
-          "<span class='addr-text'>" + s.addr_count + " адр.</span>" +
+          "<span class='addr-text'>" + s.addr_count + "</span>" +
           "<span class='addr-delta'>" + sumTxt + "</span>" +
         "</td>";
     } else {
       addrCellHtml = "<td>" + s.addr_count + "</td>";
     }
 
+    let ogrnHtml = "";
+    if (s.ogrns && s.ogrns.length > 0) {
+      ogrnHtml = "<span class='org-ogrn'>ОГРН: " + esc(s.ogrns[0]) + "</span>";
+    }
+
     tr.innerHTML =
       "<td class='toggle-cell'>+</td>" +
       "<td class='org-cell'>" +
         "<span class='org-name'>" + esc(org) + "</span>" +
+        ogrnHtml +
         "<span class='org-score' style='color:" + color + "'>" +
           s.trust.toFixed(0) + "%" +
         "</span>" +
@@ -695,7 +750,6 @@ function render() {
                        : "marker-other";
       const mass = (s.mass_date && r.date === s.mass_date);
 
-      /* дата: пастельный фон (если массовая) + красный шрифт (если выходной) */
       const dateClasses = [];
       if (mass) dateClasses.push("mass-date");
       if (r.is_holiday) dateClasses.push("holiday-date");
@@ -721,6 +775,10 @@ function render() {
           "<td class='house-addr'>" + esc(r.addr) + "</td>";
       }
 
+      const viewHtml = r.has_real_screens
+        ? "<span class='btn-view'>Смотреть</span>"
+        : "";
+
       const htr = document.createElement("tr");
       htr.className = "house-row" + (isOpen ? " visible" : "");
       htr.innerHTML =
@@ -729,13 +787,15 @@ function render() {
         addrCell +
         "<td" + dateClass + dateStyle + ">" + esc(r.date) + "</td>" +
         "<td class='" + markerCls + "'>" + esc(r.marker_long) + "</td>" +
-        "<td><span class='btn-view'>Смотреть</span></td>";
+        "<td>" + viewHtml + "</td>";
 
       const btn = htr.querySelector(".btn-view");
-      btn.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        openOverlay(r);
-      });
+      if (btn) {
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          openOverlay(r);
+        });
+      }
 
       tbody.appendChild(htr);
       houseRows.push(htr);
@@ -767,21 +827,31 @@ function openOverlay(record) {
     document.getElementById("ov_img3"),
   ];
 
-  const srcs = [record.scr_a, record.scr_b, record.scr_c];
-  if (record.scr_pdf) srcs.push(record.scr_pdf);
-
   if (slideshowTimer) { clearInterval(slideshowTimer); slideshowTimer = null; }
-  imgs.forEach(im => { im.classList.remove("active"); im.src = ""; });
+
+  const srcs = (record.screens && record.screens.length)
+    ? record.screens.slice()
+    : [record.scr_a, record.scr_b, record.scr_c]
+        .filter(Boolean)
+        .concat(record.scr_pdf ? [record.scr_pdf] : []);
+
+  imgs.forEach(im => {
+    im.classList.remove("active");
+    im.removeAttribute("src");
+    im.style.display = "none";
+  });
 
   srcs.forEach((src, i) => {
+    if (i >= imgs.length) return;
     imgs[i].src = src;
+    imgs[i].style.display = "";
   });
   imgs[0].classList.add("active");
 
   slideshowState.imgs = imgs;
   slideshowState.cur = 0;
   slideshowState.paused = false;
-  slideshowState.activeCount = srcs.length;
+  slideshowState.activeCount = Math.min(srcs.length, imgs.length);
 
   ov.classList.remove("paused");
   document.getElementById("ov_caption").textContent =
@@ -794,6 +864,7 @@ function openOverlay(record) {
 function startSlideshowTimer() {
   if (slideshowTimer) { clearInterval(slideshowTimer); slideshowTimer = null; }
   const n = slideshowState.activeCount;
+  if (n <= 0) return;
   slideshowTimer = setInterval(() => {
     if (slideshowState.paused) return;
     if (slideshowState.cur >= n - 1) {
@@ -822,7 +893,8 @@ function closeOverlay() {
   if (slideshowTimer) { clearInterval(slideshowTimer); slideshowTimer = null; }
   slideshowState.imgs.forEach(im => {
     im.classList.remove("active");
-    im.src = "";
+    im.removeAttribute("src");
+    im.style.display = "none";
   });
   slideshowState.imgs = [];
   slideshowState.cur = 0;
@@ -878,7 +950,7 @@ document.querySelectorAll("th[data-key]").forEach(th => {
   });
 });
 
-document.getElementById("mass_min").textContent = MASS_DATE_MIN;
+document.getElementById("mass_min") && (document.getElementById("mass_min").textContent = MASS_DATE_MIN);
 
 document.getElementById("btn-expand-all").addEventListener("click", () => {
   const btn = document.getElementById("btn-expand-all");
@@ -903,17 +975,15 @@ render();
 
 # ============================== ОЧИСТКА JPG ==============================
 def trash_unused_jpgs(records):
-    """
-    Найти все scrNNNN.jpg, использованные в contracts*.log.
-    Найти все *.jpg в JPG_DIR, которых там нет.
-    Переместить их в TRASH_DIR (D:\\IN\\OLD\\JPG\\).
-    """
     used = set()
     for r in records:
         for k in ("scr_a", "scr_b", "scr_c", "scr_pdf"):
             v = r.get(k) or ""
             if v:
                 used.add(v)
+        for s in r.get("screens") or []:
+            if s:
+                used.add(s)
 
     all_jpgs = sorted(JPG_DIR.glob("*.jpg"), key=lambda p: p.name)
     unused = [p for p in all_jpgs if p.name not in used]
@@ -995,12 +1065,15 @@ def main():
     print(f"[+] сводка по УК (top-10 по trust ↑):")
     for org, s in sorted(org_summary.items(),
                          key=lambda kv: kv[1]["trust"])[:10]:
+        ogrn_txt = s["ogrns"][0] if s.get("ogrns") else "-"
         print(f"    {org[:50]:50s}  trust={s['trust']:5.1f}%  "
               f"addr={s['addr_count']:3d}  "
               f"Н={s['n_count']:3d}  Ж={s['j_count']:3d}  "
-              f"Δ<0: n={s['neg_count']:3d} sum={s['neg_sum']:>10.1f}  "
+              f"Э={s['e_count']:3d}  О={s['o_count']:3d}  "
+              f"Δ<0: n={s['neg_count']:3d} sum={s['neg_sum']:>10.2f}  "
               f"hol={s['holiday_count']:3d}  "
-              f"mass={s['mass_date'] or '-'}")
+              f"mass={s['mass_date'] or '-'}  "
+              f"ogrn={ogrn_txt}")
 
     data_js = json.dumps(records, ensure_ascii=False)
     org_js = json.dumps(org_stats, ensure_ascii=False)
