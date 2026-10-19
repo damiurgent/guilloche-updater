@@ -13,11 +13,16 @@ make_report2.py — генератор HTML-отчёта по проверке �
   * LOG_DIR (%TEMP%\IN\LOG) отделён от SCRIPT_DIR.
   * Руководитель ЮЛ берётся из ЕГРЮЛ XML (D:\DB\XML\egrul_omsk_deep_final.xml)
     по ОГРН и выводится во второй строке ячейки организации.
-  * Статистика Д — как в первой итерации: из gisjkh-ufo*.log.
+  * Статистика Д — из gisjkh-ufo*.log.
     (Попытка брать Д из d_cases.log ОТКАЧЕНА.)
   * Аварийные дома: адреса из avar.txt (SCRIPT_DIR) исключаются
     из отчёта и из статистики доверия полностью.
-  * Из main() убрана «консольная статистика» — только ключевые шаги.
+
+Исправление итерации 2.1:
+  * RE_HOUSE_INFO был слишком строг: требовал строгий порядок
+    org → addr → pdf → date через \s+ и НЕ матчил строки с real='...'
+    между pdf и date. Теперь ключи org/addr/pdf/date ищутся
+    в любом порядке через lookahead, real игнорируется.
 """
 
 import re
@@ -129,15 +134,12 @@ RE_FILENAME_OGRN = re.compile(r"^contracts(\d{10,})\.log$")
 
 RE_SCR_IN_ERRLOG = re.compile(r"(scr\d{6}\.png)")
 
-
 def _iter_contract_files():
     return sorted(LOG_DIR.glob("contracts*.log"), key=lambda p: p.name)
-
 
 def _extract_ogrn(filename: str) -> str:
     m = RE_FILENAME_OGRN.match(filename)
     return m.group(1) if m else ""
-
 
 def _extract_delta_value(pdf_again: str):
     if not pdf_again:
@@ -149,7 +151,6 @@ def _extract_delta_value(pdf_again: str):
         return float(m.group(1).replace(",", "."))
     except Exception:
         return None
-
 
 def _is_holiday(date_str: str) -> bool:
     if not date_str:
@@ -174,12 +175,10 @@ def _is_holiday(date_str: str) -> bool:
 
     return False
 
-
 def _is_real_scr(name: str) -> bool:
     if not name:
         return False
     return bool(re.match(r"^scr\d{6}\.png$", name))
-
 
 def parse_contracts_logs():
     records = []
@@ -279,12 +278,15 @@ def parse_contracts_logs():
     return result
 
 # ============================== ПАРСИНГ gisjkh-ufo*.log ==============================
+# Итерация 2.1: ключи org/addr/pdf/date ищутся lookahead-ами в ЛЮБОМ порядке.
+# Раньше регулярка требовала строгий порядок и падала на строках с real='...'
+# между pdf и date — из-за этого Д не привязывалось почти ни к каким УК.
 RE_HOUSE_INFO = re.compile(
     r"house_info:\s+"
-    r"org='([^']*)'\s+"
-    r"addr='([^']*)'\s+"
-    r"pdf='([^']*)'\s+"
-    r"date='([^']*)'"
+    r"(?=.*?\borg='([^']*)')"
+    r"(?=.*?\baddr='([^']*)')"
+    r"(?=.*?\bpdf='([^']*)')"
+    r"(?=.*?\bdate='([^']*)')"
 )
 RE_RESULT_MARKER = re.compile(
     r"result_text:\s*'([^']*)'\s+marker:\s*'([^']*)'"
@@ -295,7 +297,6 @@ RE_RESULT_NONE = re.compile(
 
 def _iter_gisjkh_files():
     return sorted(LOG_DIR.glob("gisjkh-ufo*.log"), key=lambda p: p.name)
-
 
 def parse_gisjkh_logs():
     stats = {}
@@ -321,7 +322,6 @@ def parse_gisjkh_logs():
                     current_org = None
                     continue
     return stats
-
 
 def _bump(stats: dict, org: str, marker: str):
     if org not in stats:
@@ -357,6 +357,83 @@ def compute_mass_date_per_org(records):
                 result[org] = {"date": d, "count": max_count}
                 break
     return result
+
+# ============================== НОРМАЛИЗАЦИЯ И ПРИВЯЗКА Д ==============================
+def _norm_org(s: str) -> str:
+    """Устойчивая нормализация org для привязки Д (gisjkh) к records.
+
+    Подтверждено реальными примерами в логах:
+      * «» (U+00AB/U+00BB) и <> (U+003C/U+003E) — приводим к ASCII ".
+      * кратные пробелы — схлопываем.
+      * регистр — upper().
+
+    Правила «ООО vs ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ»
+    НЕ вводим — в предоставленных логах такого расхождения нет.
+    """
+    if not s:
+        return ""
+    s = s.upper().strip()
+    s = s.replace("«", '"').replace("»", '"')
+    s = s.replace("<", '"').replace(">", '"')
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def _norm_addr(s: str) -> str:
+    """Адреса уже нормализованы в ГИС — только strip() по ТЗ."""
+    return (s or "").strip()
+
+
+def _match_d_per_org(records, org_stats):
+    """Привязка Д (gisjkh) к records.
+
+    Возвращает {org_raw_from_records: d_count}.
+
+    1. Пробуем ключ (_norm_org(org), _norm_addr(addr)).
+    2. Если не нашли — по _norm_addr(addr), но только если в records
+       для этого адреса ровно ОДНА _norm_org. Иначе — не приписываем
+       (лучше ноль, чем ложное совпадение).
+    3. org_stats — словарь {org_from_gisjkh: {"Д": ...}}.
+
+    Формулу trust и Н/Ж/Э/О НЕ меняем.
+    """
+    # Индекс: нормализованный org из gisjkh -> статистика
+    org_stats_norm = {}
+    for raw_org, st in org_stats.items():
+        org_stats_norm[_norm_org(raw_org)] = st
+
+    # Индекс: адрес -> множество нормализованных org в records
+    addr_to_orgs = {}
+    for r in records:
+        a = _norm_addr(r["addr"])
+        o = _norm_org(r["org"])
+        addr_to_orgs.setdefault(a, set()).add(o)
+
+    # Результат: для каждой org-из-records — сколько Д привязали.
+    # records уже дедуплицированы по (org, addr), поэтому max — безопасно.
+    result = {}
+    for r in records:
+        raw_org = r["org"]
+        o_norm = _norm_org(raw_org)
+        a_norm = _norm_addr(r["addr"])
+
+        # 1) по (org_norm, addr_norm) — фактически по org_norm
+        st = org_stats_norm.get(o_norm)
+        d_here = st.get("Д", 0) if st else 0
+
+        # 2) если пусто — по адресу, только при единственной org_norm
+        if d_here == 0:
+            orgs = addr_to_orgs.get(a_norm, set())
+            if len(orgs) == 1:
+                only = next(iter(orgs))
+                st2 = org_stats_norm.get(only)
+                if st2:
+                    d_here = st2.get("Д", 0)
+
+        result[raw_org] = max(result.get(raw_org, 0), d_here)
+
+    return result
+
 
 # ============================== СВОДКА ПО УК ==============================
 def compute_org_summary(records, org_stats, mass_per_org, egrul_directors):
@@ -403,9 +480,11 @@ def compute_org_summary(records, org_stats, mass_per_org, egrul_directors):
         if r.get("is_holiday"):
             s["holiday_count"] += 1
 
+    # Гибридная привязка Д (gisjkh) к records.
+    d_per_org = _match_d_per_org(records, org_stats)
+
     for org, s in summary.items():
-        backend = org_stats.get(org)
-        d = backend.get("Д", 0) if backend else 0
+        d = d_per_org.get(org, 0)
 
         numerator = d
         denominator = d + s["n_count"] + s["j_count"] + s["e_count"] + s["o_count"]
@@ -1102,7 +1181,6 @@ def _collect_used_screens(records):
             print(f"[!] не удалось прочитать {DOWNLOAD_ERRORS_SRC}: {e}")
 
     return used
-
 
 def trash_unused_imgs(records):
     used = _collect_used_screens(records)
