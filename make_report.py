@@ -1,14 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-make_report.py — генератор HTML-отчёта по проверке ЭП договоров УК.
+make_report2.py — генератор HTML-отчёта по проверке ЭП договоров УК.
 
-Правка 9: RE_LINE2 допускает отсутствие pdf_again во 2-й строке блока.
-          Формат: "scrNNNN.jpg - pdf_again -- ep_name" ИЛИ "scrNNNN.jpg - ep_name".
+Итерация 2:
+  * PNG вместо JPG: scrNNNNNN.png (ровно 6 цифр).
+  * Папка картинок: %TEMP%\IN\IMG.
+  * Отчёт: %TEMP%\IN\IMG\report.html.
+  * download_errors.log: из SCRIPT_DIR копируется с перезаписью в IMG_DIR,
+    кнопка «Скачать лог ошибок» — ссылка на файл.
+  * Перенос неиспользуемых картинок в D:\IN\OLD\IMG — ЗАКОММЕНТИРОВАН.
+  * Блоки 3..5 строк — слайдшоу до 5 кадров.
+  * LOG_DIR (%TEMP%\IN\LOG) отделён от SCRIPT_DIR.
+  * Руководитель ЮЛ берётся из ЕГРЮЛ XML (D:\DB\XML\egrul_omsk_deep_final.xml)
+    по ОГРН и выводится во второй строке ячейки организации.
+  * Статистика Д — как в первой итерации: из gisjkh-ufo*.log.
+    (Попытка брать Д из d_cases.log ОТКАЧЕНА.)
+  * Аварийные дома: адреса из avar.txt (SCRIPT_DIR) исключаются
+    из отчёта и из статистики доверия полностью.
+  * Из main() убрана «консольная статистика» — только ключевые шаги.
 """
 
 import re
 import json
 import shutil
+import os
+import xml.etree.ElementTree as ET
 from datetime import date as _date
 from pathlib import Path
 from tempfile import gettempdir
@@ -27,10 +43,21 @@ except Exception as _e:
 # ============================== ПУТИ ==============================
 BASE_DIR = Path(gettempdir()) / "IN"
 LOG_DIR = BASE_DIR / "LOG"
-JPG_DIR = BASE_DIR / "JPG"
-OUT_HTML = JPG_DIR / "report.html"
+IMG_DIR = BASE_DIR / "IMG"
+OUT_HTML = IMG_DIR / "report.html"
 
-TRASH_DIR = Path(r"D:\IN\OLD\JPG")
+SCRIPT_DIR = Path(os.environ.get("USERPROFILE", str(Path.home()))) \
+             / "Desktop" / "Selenium" / "make_report2"
+
+DOWNLOAD_ERRORS_SRC = SCRIPT_DIR / "download_errors.log"
+DOWNLOAD_ERRORS_DST = IMG_DIR / "download_errors.log"
+
+AVAR_TXT = SCRIPT_DIR / "avar.txt"
+
+EGRUL_XML = Path(r"D:\DB\XML\egrul_omsk_deep_final.xml")
+
+# Закомментированный блок переноса: было D:\IN\OLD\JPG
+TRASH_DIR = Path(r"D:\IN\OLD\IMG")
 
 # ============================== НАСТРОЙКИ ==============================
 MARKER_LONG = {
@@ -44,12 +71,54 @@ MASS_DATE_MIN = 2
 MASS_DATE_HINT = ("проверить кворумы МКД по бюллетеням "
                   "и законность пролонгации")
 
+# ============================== ЕГРЮЛ ==============================
+def load_egrul_directors(xml_path: Path) -> dict:
+    """OGRN (str) -> director (str). Пустые <director/> пропускаются."""
+    result = {}
+    if not xml_path.exists():
+        print(f"[!] нет файла {xml_path}")
+        return result
+    try:
+        tree = ET.parse(str(xml_path))
+    except Exception as e:
+        print(f"[!] ошибка разбора {xml_path}: {e}")
+        return result
+    root = tree.getroot()
+    for ent in root.findall("entity"):
+        ogrn_el = ent.find("ogrn")
+        dir_el = ent.find("director")
+        if ogrn_el is None or ogrn_el.text is None:
+            continue
+        ogrn = ogrn_el.text.strip()
+        director = (dir_el.text or "").strip() if dir_el is not None else ""
+        if not ogrn:
+            continue
+        result[ogrn] = director
+    return result
+
+# ============================== AVAR ==============================
+def load_avar(path: Path) -> set:
+    """set[str] адресов из avar.txt (формат ГИС, как есть)."""
+    result = set()
+    if not path.exists():
+        print(f"[!] нет файла {path}")
+        return result
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                addr = line.strip()
+                if addr:
+                    result.add(addr)
+    except Exception as e:
+        print(f"[!] ошибка чтения {path}: {e}")
+    return result
+
 # ============================== ПАРСИНГ contracts*.log ==============================
-RE_SCR = r"scr(?:\d{4,}|XXXX)\.jpg"
+# PNG, ровно 6 цифр.
+RE_SCR = r"scr(?:\d{6}|XXXX)\.png"
 RE_LINE1 = re.compile(
     r"^(" + RE_SCR + r")\s*-\s*(.+?)\s*--\s*(.+?)\s*---\s*(.+?)\s*----\s*(.+)$"
 )
-# Правка 9: pdf_again опционально.
 RE_LINE2 = re.compile(r"^(" + RE_SCR + r")\s*-\s*(?:(.+?)\s*--\s*)?(.+)$")
 RE_LINE3 = re.compile(r"^(" + RE_SCR + r")\s*-\s*(.+)$")
 RE_LINE4_SCR = re.compile(r"^(" + RE_SCR + r")\s*$")
@@ -57,6 +126,8 @@ RE_LINE4_SCR = re.compile(r"^(" + RE_SCR + r")\s*$")
 RE_DELTA_VALUE = re.compile(r"=\s*(-?\d+(?:[.,]\d+)?)\s*$")
 RE_DATE_DDMMYYYY = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
 RE_FILENAME_OGRN = re.compile(r"^contracts(\d{10,})\.log$")
+
+RE_SCR_IN_ERRLOG = re.compile(r"(scr\d{6}\.png)")
 
 
 def _iter_contract_files():
@@ -107,15 +178,19 @@ def _is_holiday(date_str: str) -> bool:
 def _is_real_scr(name: str) -> bool:
     if not name:
         return False
-    return bool(re.match(r"^scr\d{4,}\.jpg$", name))
+    return bool(re.match(r"^scr\d{6}\.png$", name))
 
 
 def parse_contracts_logs():
     records = []
-    seen_keys = set()
 
     for path in _iter_contract_files():
         ogrn = _extract_ogrn(path.name)
+        try:
+            file_mtime = path.stat().st_mtime
+        except Exception:
+            file_mtime = 0.0
+
         text = path.read_text(encoding="utf-8")
         blocks = re.split(r"\r?\n\r?\n", text.strip())
         for block in blocks:
@@ -130,6 +205,9 @@ def parse_contracts_logs():
 
             org_clean = (org or "").strip()
             if (not org_clean) or (org_clean == "Адрес дома:"):
+                continue
+            # Итерация 2: записи с неизвестной УК ("?") исключаем полностью.
+            if org_clean == "?":
                 continue
             org = org_clean.upper()
 
@@ -158,14 +236,6 @@ def parse_contracts_logs():
                 delta_value = round(delta_value, 2)
             hol = _is_holiday(date_str)
 
-            key = (
-                (org or "").strip().lower(),
-                (addr or "").strip().lower(),
-            )
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-
             records.append({
                 "src": path.name,
                 "ogrn": ogrn,
@@ -184,8 +254,29 @@ def parse_contracts_logs():
                 "scr_pdf": screens[3] if len(screens) > 3 else "",
                 "delta_value": delta_value,
                 "is_holiday": hol,
+                "_mtime": file_mtime,
             })
-    return records
+
+    # Итерация 2: дедупликация по (org, addr) — берём самую свежую
+    # по mtime файла contracts*.log. При равенстве mtime — первая
+    # встреченная (порядок _iter_contract_files() стабилен).
+    best = {}
+    for r in records:
+        key = ((r["org"] or "").strip().lower(),
+               (r["addr"] or "").strip().lower())
+        cur = best.get(key)
+        if cur is None or r["_mtime"] > cur["_mtime"]:
+            best[key] = r
+
+    result = []
+    for r in records:
+        key = ((r["org"] or "").strip().lower(),
+               (r["addr"] or "").strip().lower())
+        if best.get(key) is r:
+            r.pop("_mtime", None)
+            result.append(r)
+
+    return result
 
 # ============================== ПАРСИНГ gisjkh-ufo*.log ==============================
 RE_HOUSE_INFO = re.compile(
@@ -268,7 +359,7 @@ def compute_mass_date_per_org(records):
     return result
 
 # ============================== СВОДКА ПО УК ==============================
-def compute_org_summary(records, org_stats, mass_per_org):
+def compute_org_summary(records, org_stats, mass_per_org, egrul_directors):
     summary = {}
     for r in records:
         org = r["org"]
@@ -287,6 +378,7 @@ def compute_org_summary(records, org_stats, mass_per_org):
                 "neg_sum": 0.0,
                 "holiday_count": 0,
                 "ogrns": [],
+                "director": "",
             }
         s = summary[org]
         s["addr_count"] += 1
@@ -330,6 +422,9 @@ def compute_org_summary(records, org_stats, mass_per_org):
             s["mass_count"] = mass["count"]
 
         s["ogrns"] = sorted(s["ogrns"])[:1]
+
+        if s["ogrns"]:
+            s["director"] = egrul_directors.get(s["ogrns"][0], "")
 
     return summary
 
@@ -529,6 +624,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <tbody id="tbody"></tbody>
 </table>
 
+<div style="margin-top:16px;">
+  <a id="btn-download-errors" href="download_errors.log" download="download_errors.log"
+     style="display:inline-block; padding:6px 14px; border:1px solid #888;
+            border-radius:4px; background:#f0f0f0; font-size:13px;
+            text-decoration:none; color:#222;">
+    Скачать лог ошибок
+  </a>
+</div>
+
 <div class="legal">
   <h2>Дисклеймер</h2>
   <p>
@@ -574,6 +678,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     <img id="ov_img1" alt="">
     <img id="ov_img2" alt="">
     <img id="ov_img3" alt="">
+    <img id="ov_img4" alt="">
     <div class="caption" id="ov_caption"></div>
   </div>
 </div>
@@ -660,7 +765,7 @@ function render() {
       trust: 0, addr_count: 0, n_count: 0, j_count: 0,
       e_count: 0, o_count: 0,
       mass_date: "", mass_count: 0, neg_count: 0, neg_sum: 0,
-      holiday_count: 0, ogrns: []
+      holiday_count: 0, ogrns: [], director: ""
     };
     const color = trustColor(s.trust);
 
@@ -700,7 +805,8 @@ function render() {
 
     let ogrnHtml = "";
     if (s.ogrns && s.ogrns.length > 0) {
-      ogrnHtml = "<span class='org-ogrn'>ОГРН: " + esc(s.ogrns[0]) + "</span>";
+      var tail = s.director ? (", Руководитель: " + esc(s.director)) : "";
+      ogrnHtml = "<span class='org-ogrn'>ОГРН: " + esc(s.ogrns[0]) + tail + "</span>";
     }
 
     tr.innerHTML =
@@ -825,6 +931,7 @@ function openOverlay(record) {
     document.getElementById("ov_img1"),
     document.getElementById("ov_img2"),
     document.getElementById("ov_img3"),
+    document.getElementById("ov_img4"),
   ];
 
   if (slideshowTimer) { clearInterval(slideshowTimer); slideshowTimer = null; }
@@ -973,8 +1080,8 @@ render();
 </html>
 """
 
-# ============================== ОЧИСТКА JPG ==============================
-def trash_unused_jpgs(records):
+# ============================== ОЧИСТКА IMG (закомментировано в main) ==============================
+def _collect_used_screens(records):
     used = set()
     for r in records:
         for k in ("scr_a", "scr_b", "scr_c", "scr_pdf"):
@@ -985,11 +1092,26 @@ def trash_unused_jpgs(records):
             if s:
                 used.add(s)
 
-    all_jpgs = sorted(JPG_DIR.glob("*.jpg"), key=lambda p: p.name)
-    unused = [p for p in all_jpgs if p.name not in used]
+    if DOWNLOAD_ERRORS_SRC.exists():
+        try:
+            err_text = DOWNLOAD_ERRORS_SRC.read_text(encoding="utf-8",
+                                                     errors="replace")
+            for m in RE_SCR_IN_ERRLOG.finditer(err_text):
+                used.add(m.group(1))
+        except Exception as e:
+            print(f"[!] не удалось прочитать {DOWNLOAD_ERRORS_SRC}: {e}")
+
+    return used
+
+
+def trash_unused_imgs(records):
+    used = _collect_used_screens(records)
+
+    all_imgs = sorted(IMG_DIR.glob("*.png"), key=lambda p: p.name)
+    unused = [p for p in all_imgs if p.name not in used]
 
     print(f"[+] использовано скринов: {len(used)}")
-    print(f"[+] всего .jpg в JPG_DIR: {len(all_jpgs)}")
+    print(f"[+] всего .png в IMG_DIR: {len(all_imgs)}")
     print(f"[+] неиспользованных: {len(unused)}")
     for p in unused:
         print(f"    — {p.name}")
@@ -1039,41 +1161,44 @@ def main():
         print(f"[!] нет папки {LOG_DIR}")
         return
 
+    if not IMG_DIR.exists():
+        print(f"[!] нет папки {IMG_DIR}")
+        return
+
+    egrul_directors = load_egrul_directors(EGRUL_XML)
+    print(f"[+] ЕГРЮЛ: {EGRUL_XML} -> {len(egrul_directors)} записей")
+
+    avar_set = load_avar(AVAR_TXT)
+    print(f"[+] avar.txt -> {len(avar_set)} аварийных адресов")
+
     records = parse_contracts_logs()
     if not records:
         print(f"[!] нет записей в contracts*.log")
         return
 
+    before = len(records)
+    records = [r for r in records if r["addr"].strip() not in avar_set]
+    print(f"[+] записей: {before}, после фильтра аварийных: {len(records)}")
+
+    if not records:
+        print(f"[!] после фильтра аварийных не осталось записей")
+        return
+
     org_stats = parse_gisjkh_logs()
-    print(f"[+] gisjkh-ufo*.log: УК в статистике — {len(org_stats)}")
 
     mass_per_org = compute_mass_date_per_org(records)
-    print(f"[+] УК с массовой датой: {len(mass_per_org)}")
-    for org, m in mass_per_org.items():
-        print(f"    {org[:50]:50s}  {m['date']} × {m['count']}")
 
-    org_summary = compute_org_summary(records, org_stats, mass_per_org)
+    org_summary = compute_org_summary(records, org_stats, mass_per_org,
+                                      egrul_directors)
 
-    total_neg = sum(1 for r in records
-                    if r.get("delta_value") is not None
-                    and r["delta_value"] < 0)
-    print(f"[+] домов с отрицательной дельтой (Δ<0): {total_neg}")
-
-    total_hol = sum(1 for r in records if r.get("is_holiday"))
-    print(f"[+] домов с датой ДУ в выходной/праздник: {total_hol}")
-
-    print(f"[+] сводка по УК (top-10 по trust ↑):")
-    for org, s in sorted(org_summary.items(),
-                         key=lambda kv: kv[1]["trust"])[:10]:
-        ogrn_txt = s["ogrns"][0] if s.get("ogrns") else "-"
-        print(f"    {org[:50]:50s}  trust={s['trust']:5.1f}%  "
-              f"addr={s['addr_count']:3d}  "
-              f"Н={s['n_count']:3d}  Ж={s['j_count']:3d}  "
-              f"Э={s['e_count']:3d}  О={s['o_count']:3d}  "
-              f"Δ<0: n={s['neg_count']:3d} sum={s['neg_sum']:>10.2f}  "
-              f"hol={s['holiday_count']:3d}  "
-              f"mass={s['mass_date'] or '-'}  "
-              f"ogrn={ogrn_txt}")
+    if DOWNLOAD_ERRORS_SRC.exists():
+        try:
+            shutil.copyfile(DOWNLOAD_ERRORS_SRC, DOWNLOAD_ERRORS_DST)
+            print(f"[+] download_errors.log → {DOWNLOAD_ERRORS_DST}")
+        except Exception as e:
+            print(f"[!] не удалось скопировать download_errors.log: {e}")
+    else:
+        print(f"[!] нет файла {DOWNLOAD_ERRORS_SRC}")
 
     data_js = json.dumps(records, ensure_ascii=False)
     org_js = json.dumps(org_stats, ensure_ascii=False)
@@ -1090,9 +1215,9 @@ def main():
 
     OUT_HTML.write_text(html_text, encoding="utf-8")
     print(f"[+] report: {OUT_HTML}")
-    print(f"[+] records: {len(records)}")
 
-    trash_unused_jpgs(records)
+    # Итерация 2: перенос неиспользуемых картинок ЗАКОММЕНТИРОВАН.
+    # trash_unused_imgs(records)
 
 if __name__ == "__main__":
     main()
