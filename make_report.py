@@ -1,920 +1,1080 @@
 # -*- coding: utf-8 -*-
 """
 make_report2.py — генератор HTML-отчёта по проверке ЭП договоров УК.
+Итерация 2, первая волна.
+
+CLI:
+    python make_report2.py
+    python make_report2.py --no-trash
+    python make_report2.py --only-ogrn 1065506006257
+    python make_report2.py --no-egrul
 """
 
+from __future__ import annotations
+import os
 import re
+import sys
 import json
 import shutil
-import os
+import argparse
+import traceback
 import xml.etree.ElementTree as ET
-import zlib
-import struct
-from datetime import date as _date
 from pathlib import Path
+from collections import defaultdict
+from datetime import date as _date
 from tempfile import gettempdir
 
-# ============================== ПРАЗДНИКИ ==============================
-try:
-    import holidays as _holidays
-    RU_HOLIDAYS = _holidays.RU(years=range(2000, 2032))
-    _HAS_HOLIDAYS = True
-except Exception as _e:
-    RU_HOLIDAYS = None
-    _HAS_HOLIDAYS = False
 
-# ============================== ПУТИ ==============================
-BASE_DIR = Path(gettempdir()) / "IN"
-LOG_DIR = BASE_DIR / "LOG"
-IMG_DIR = BASE_DIR / "IMG"
-OUT_HTML = IMG_DIR / "report.html"
+# ============================================================
+# ПУТИ
+# ============================================================
+BASE_DIR   = Path(gettempdir()) / "IN"
+LOG_DIR    = BASE_DIR / "LOG"
+IMG_DIR    = BASE_DIR / "IMG"
+TRASH_DIR  = BASE_DIR / "OLD" / "IMG"
+OUT_HTML   = IMG_DIR / "report.html"
 
-SCRIPT_DIR = Path(os.environ.get("USERPROFILE", str(Path.home()))) \
-             / "Desktop" / "Selenium" / "make_report2"
+XML_212    = Path(r"D:\DB\XML\egrul_omsk_212.xml")
+XML_DEEP   = Path(r"D:\DB\XML\egrul_omsk_deep_final.xml")
 
-DOWNLOAD_ERRORS_SRC = SCRIPT_DIR / "download_errors.log"
-DOWNLOAD_ERRORS_DST = IMG_DIR / "download_errors.log"
-AVAR_TXT = SCRIPT_DIR / "avar.txt"
+SCRIPT_DIR = Path(__file__).resolve().parent
+OGRNS_ACT  = SCRIPT_DIR / "ogrns_act.txt"
+NPA_LIST   = SCRIPT_DIR / "npa_list.txt"
+DL_ERRORS  = SCRIPT_DIR / "download_errors.log"
 
-EGRUL_XML = Path(r"D:\DB\XML\egrul_omsk_deep_final.xml")
-EGRUL_SHORT_XML = Path(r"D:\DB\XML\egrul_omsk_deep_final_short.xml")
-EGRUL_LOST_SHORT_XML = Path(r"D:\DB\XML\egrul_omsk_lost_short.xml")
-TRASH_DIR = Path(r"D:\IN\OLD\IMG")
 
-BLACKLIST_OGRN = {
-    "1165543087999", "1085543030787", "1075590844304", "1175543038418",
-    "1175543039448", "1175543939918", "1135543629720", "1435543028720",
-    "1165583077480", "1195542005087"
-}
-
-# ============================== НАСТРОЙКИ ==============================
+# ============================================================
+# КОНСТАНТЫ
+# ============================================================
 MARKER_LONG = {
     "Н": "Подпись верна, но НЕДЕЙСТВИТЕЛЬНА",
     "Ж": "Подпись НЕВЕРНА и НЕДЕЙСТВИТЕЛЬНА",
     "Э": "Подпись ОТСУТСТВУЕТ",
     "О": "Информация о договоре НЕ РАЗМЕЩЕНА",
+    "Д": "Подпись ДЕЙСТВИТЕЛЬНА",
 }
-MASS_DATE_MIN = 2
-MASS_DATE_HINT = (
-    "Проверить кворумы каждого МКД по бюллетеням в списке одинаковых дат и "
-    "если бюллетеней на кворумы всех домов не хватает, то отягчающим обстоятельством "
-    "служит проведение голосований по Протоколу собрания в офисе УК, а также,"
-    "замурованные входы в подвалы в большинстве подъездов (ущерб права на "
-    "собрания и на самооборону в помещениях ГО и ЧС). Пролонгация незаконна."
-    "Причины завышения жилой площади - соискание субсидий из бюджетов. И напротив,"
-    "завышения ОДИ в платёжках - раздувание платежей с собственников."
-)
 
-# ============================== ПАРСИНГ PNG ==============================
-def read_png_chunks(img_path: Path) -> dict:
-    if not img_path.exists(): return {}
-    texts = {}
+MASS_DATE_MIN      = 2
+MASS_JOKE_DATES    = {"01.01", "01.04", "01.05", "08.03", "23.02", "09.05", "12.06", "04.11"}
+LOW_CAPITAL_VALUE  = 10000.0
+
+TECH_FAIL_MARKERS = {
+    "ZIP_FAIL", "NO_DOWNLOAD_BTN", "PDF_HTML_STUB", "SIGN_INVALID_FORMAT",
+    "UIDS_PARAM_MISSING", "O_NO_LINK", "O_NO_FILES", "E_NO_SIGN", "E_UNKNOWN",
+}
+TECH_OK_MARKERS = {"ZIP_FAIL_FALLBACK_OK"}
+
+
+# ============================================================
+# НОРМАЛИЗАЦИЯ
+# ============================================================
+def norm_name(s: str) -> str:
+    if not s:
+        return ""
+    s = s.upper().replace("Ё", "Е")
+    s = s.replace("«", " ").replace("»", " ").replace('"', " ").replace("'", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    repl = [
+        (r"\bОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ\b", "ООО"),
+        (r"\bПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО\b", "ПАО"),
+        (r"\bЗАКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО\b", "ЗАО"),
+        (r"\bАКЦИОНЕРНОЕ ОБЩЕСТВО\b", "АО"),
+        (r"\bУПРАВЛЯЮЩАЯ КОМПАНИЯ\b", "УК"),
+        (r"\bУПРАВЛЯЮЩАЯ ОРГАНИЗАЦИЯ\b", "УО"),
+        (r"\bЖИЛИЩНО-КОММУНАЛЬНАЯ ОРГАНИЗАЦИЯ\b", "ЖКО"),
+        (r"\bЖИЛИЩНАЯ КОММУНАЛЬНАЯ ОРГАНИЗАЦИЯ\b", "ЖКО"),
+        (r"\bЖИЛИЩНО-КОММУНАЛЬНОЕ ХОЗЯЙСТВО\b", "ЖКХ"),
+        (r"\bЖИЛИЩНО-КОММУНАЛЬНОЕ ХОЗЯЙСТВО\b", "ЖКХ"),
+        (r"\bДИРЕКЦИЯ ЭКСПЛУАТАЦИИ ЗДАНИЙ\b", "ДЭЗ"),
+        (r"\bТОВАРИЩЕСТВО СОБСТВЕННИКОВ ЖИЛЬЯ\b", "ТСЖ"),
+        (r"\bТОВАРИЩЕСТВО СОБСТВЕННИКОВ НЕДВИЖИМОСТИ\b", "ТСН"),
+        (r"\bЖИЛИЩНО-СТРОИТЕЛЬНЫЙ КООПЕРАТИВ\b", "ЖСК"),
+    ]
+    for pat, rep in repl:
+        s = re.sub(pat, rep, s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def norm_name_short(s: str) -> str:
+    n = norm_name(s)
+    n = re.sub(r"^(ООО|АО|ПАО|ЗАО|ТСЖ|ЖСК|ТСН)\s+", "", n)
+    return n.strip()
+
+
+def norm_address(s: str) -> str:
+    if not s:
+        return ""
+    s = s.upper().replace("Ё", "Е")
+    s = re.sub(r"Г\.О\.\s*ГОРОД ОМСК,?\s*Г\.\s*ОМСК,?\s*", "", s)
+    s = re.sub(r"ОМСКАЯ ОБЛАСТЬ,?\s*", "", s)
+    s = re.sub(r"СТРАНИЦА\s+\d+\s+ИЗ.*$", "", s)
+    s = re.sub(r"\s+", " ", s).strip().rstrip(",")
+    return s
+
+
+def address_kind(norm: str) -> str:
+    if re.search(r"(^|[\s,])(КВ\.|КВАРТИРА|КОМ\.)", norm):
+        return "home"
+    return "office"
+
+
+def norm_fio(s: str) -> str:
+    if not s:
+        return ""
+    return re.sub(r"\s+", " ", s.upper().replace("Ё", "Е")).strip()
+
+
+def compute_form(name: str) -> str:
+    if not name:
+        return "?"
+    n = name.upper()
+    if "ПУБЛИЧНОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО" in n:
+        return "ПАО"
+    if "ЗАКРЫТОЕ АКЦИОНЕРНОЕ ОБЩЕСТВО" in n:
+        return "ЗАО"
+    if "АКЦИОНЕРНОЕ ОБЩЕСТВО" in n:
+        return "АО"
+    if "ОБЩЕСТВО С ОГРАНИЧЕННОЙ ОТВЕТСТВЕННОСТЬЮ" in n:
+        return "ООО"
+    if "ТОВАРИЩЕСТВО СОБСТВЕННИКОВ ЖИЛЬЯ" in n:
+        return "ТСЖ"
+    if "ЖИЛИЩНО-СТРОИТЕЛЬНЫЙ КООПЕРАТИВ" in n:
+        return "ЖСК"
+    if "ТОВАРИЩЕСТВО СОБСТВЕННИКОВ НЕДВИЖИМОСТИ" in n:
+        return "ТСН"
+    return "?"
+
+
+def parse_date_ddmmyyyy(s: str):
+    m = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", (s or "").strip())
+    if not m:
+        return None
     try:
-        with open(img_path, "rb") as f:
-            if f.read(8) != b'\x89PNG\r\n\x1a\n': return {}
-            while True:
-                length_bytes = f.read(4)
-                if not length_bytes or len(length_bytes) < 4: break
-                length = struct.unpack(">I", length_bytes)[0]
-                chunk_type = f.read(4)
-                if not chunk_type or len(chunk_type) < 4: break
-                data = f.read(length); f.read(4)
-                if chunk_type in (b'tEXt', b'iTXt', b'zTXt'):
-                    if chunk_type == b'zTXt':
-                        parts = data.split(b'\x00', 1)
-                        if len(parts) == 2:
-                            kw = parts[0].decode('latin-1', errors='replace')
-                            texts[kw] = zlib.decompress(parts[1][1:]).decode('utf-8', errors='replace')
-                    elif chunk_type == b'tEXt':
-                        parts = data.split(b'\x00', 1)
-                        if len(parts) == 2:
-                            kw = parts[0].decode('latin-1', errors='replace')
-                            texts[kw] = parts[1].decode('latin-1', errors='replace')
-                    elif chunk_type == b'iTXt':
-                        parts = data.split(b'\x00')
-                        if len(parts) >= 2:
-                            kw = parts[0].decode('latin-1', errors='replace')
-                            texts[kw] = parts[-1].decode('utf-8', errors='replace')
-    except Exception: pass
-    return texts
+        return _date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
+    except ValueError:
+        return None
 
-def parse_area_val(text: str) -> float:
-    if not text: return 0.0
-    text = text.strip().replace(",", ".")
-    m = re.search(r"(\d+(?:\.\d+)?)", text)
-    if m:
-        try: return float(m.group(1))
-        except ValueError: pass
-    return 0.0
 
-def extract_areas_from_desc(desc: str):
-    if not desc: return 0.0, 0.0, 0.0
-    def get_val(pattern):
-        m = re.search(pattern, desc, re.IGNORECASE | re.DOTALL)
-        return parse_area_val(m.group(1)) if m else 0.0
+# ============================================================
+# ПРАЗДНИКИ
+# ============================================================
+try:
+    import holidays as _holidays
+    RU_HOLIDAYS = _holidays.RU(years=range(2000, 2032))
+    _HAS_HOLIDAYS = True
+except Exception:
+    RU_HOLIDAYS = None
+    _HAS_HOLIDAYS = False
 
-    total = get_val(r"Общая площадь дома,?\s*кв\.?м:?\s*([\d\.\,]+)")
-    living = get_val(r"Общая площадь жилых помещений,?\s*кв\.?м:?\s*([\d\.\,]+)")
-    non_living = get_val(r"Общая площадь нежилых помещений,?\s*кв\.?м:?\s*([\d\.\,]+)")
-    return total, living, non_living
 
-def extract_org_and_director_from_ocr(text: str):
-    if not text: return None, None
-    for m in re.finditer(r"\b(\d{13})\b", text):
-        val = m.group(1)
-        if len(val) == 13 and (val.startswith("1") or val.startswith("2")):
-            if val[3:5] == "55": return val, None
-    text_clean = re.sub(r"\n+", " ", text)
-    m = re.search(
-        r"в\s+лице\s+(?:[а-яё]+\s+)?([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?\s+[А-ЯЁ][а-яё]+\s+[А-ЯЁ][а-яё]+)[^\"\'«“]*?[\"\'«“]?(ОО0|ООО|000|Общество\s+с\s+ограниченной\s+ответственностью)[\"\'»”]?\s*[\"\'«“]?([^\"\'»”\n]{3,50})[\"\'»”]?", 
-        text_clean, re.IGNORECASE
-    )
-    if m:
-        fio = m.group(1).strip()
-        opf = m.group(2).upper()
-        name = m.group(3).strip()
-        clean_org = f"ООО \"{name}\""
-        return clean_org, fio
-    return None, None
+def is_holiday(date_str: str) -> bool:
+    d = parse_date_ddmmyyyy(date_str)
+    if not d:
+        return False
+    if _HAS_HOLIDAYS and RU_HOLIDAYS is not None:
+        try:
+            if d in RU_HOLIDAYS:
+                return True
+        except Exception:
+            pass
+    return d.weekday() >= 5
 
-# ============================== ЕГРЮЛ ==============================
-def load_egrul_directors(xml_path: Path) -> dict:
-    result = {}
-    if not xml_path.exists(): return result
-    try: tree = ET.parse(str(xml_path))
-    except Exception: return result
-    for ent in tree.getroot().findall("entity"):
-        ogrn_el = ent.find("ogrn")
-        dir_el = ent.find("director")
-        if ogrn_el is None or not (ogrn_el.text or "").strip(): continue
-        ogrn = ogrn_el.text.strip()
-        director = (dir_el.text or "").strip() if dir_el is not None else ""
-        result[ogrn] = director
-    return result
 
-def load_egrul_short_data(xml_path: Path) -> dict:
-    result = {}
-    if not xml_path.exists(): return result
-    try: tree = ET.parse(str(xml_path))
-    except Exception: return result
-    for ent in tree.getroot().findall("entity"):
-        ogrn_el = ent.find("ogrn")
-        if ogrn_el is None or not (ogrn_el.text or "").strip(): continue
-        ogrn = ogrn_el.text.strip()
-        name = (ent.findtext("name") or "").strip()
-        director = (ent.findtext("director") or "").strip()
-        dir_inn = (ent.findtext("director_inn") or "").strip()
-        address = (ent.findtext("address") or "").strip()
-        term_date = (ent.findtext("termination_date") or "").strip()
-        result[ogrn] = {
+# ============================================================
+# ЕГРЮЛ
+# ============================================================
+RE_BROKEN_DIRECTOR = re.compile(r"<director/>([^<]*)</director>")
+
+def _read_xml_sanitized(path: Path) -> ET.Element:
+    raw = path.read_text(encoding="utf-8")
+    raw = RE_BROKEN_DIRECTOR.sub(r"<director>\1</director>", raw)
+    return ET.fromstring(raw)
+
+
+RE_OGRN = re.compile(r"\b(\d{13}|\d{15})\b")
+
+def load_act_ogrns(path: Path = OGRNS_ACT) -> list[str]:
+    ogrns = []
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        m = RE_OGRN.search(line)
+        if m:
+            ogrns.append(m.group(1))
+    return ogrns
+
+
+def parse_212(path: Path) -> dict[str, dict]:
+    root = _read_xml_sanitized(path)
+    out = {}
+    for ent in root.iter("entity"):
+        ogrn = (ent.findtext("ogrn") or "").strip()
+        if not ogrn:
+            continue
+        out[ogrn] = {
             "ogrn": ogrn,
-            "name": name,
-            "director": director,
-            "director_inn": dir_inn,
-            "address": address,
-            "termination_date": term_date,
+            "inn": (ent.findtext("inn") or "").strip(),
+            "kpp": (ent.findtext("kpp") or "").strip(),
+            "name_full": (ent.findtext("name_full") or "").strip(),
+            "name_short": (ent.findtext("name_short") or "").strip(),
+            "status": (ent.findtext("status") or "").strip(),
+            "status_date": (ent.findtext("status_date") or "").strip(),
+            "termination_date": (ent.findtext("termination_date") or "").strip(),
         }
-    return result
+    return out
 
-# ============================== AVAR ==============================
-def load_avar(path: Path) -> set:
-    result = set()
-    if not path.exists(): return result
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                addr = line.strip()
-                if addr: result.add(addr)
-    except Exception: pass
-    return result
 
-# ============================== ПАРСИНГ contracts*.log ==============================
-RE_SCR = r"scr(?:\d{6}|XXXX)\.png"
-RE_LINE1 = re.compile(r"^(" + RE_SCR + r")\s*-\s*(.+?)\s*--\s*(.+?)\s*---\s*(.+?)\s*----\s*(.+)$")
-RE_LINE2 = re.compile(r"^(" + RE_SCR + r")\s*-\s*(?:(.+?)\s*--\s*)?(.+)$")
+def parse_deep(path: Path) -> dict[str, dict]:
+    root = _read_xml_sanitized(path)
+    out = {}
+    for ent in root.iter("entity"):
+        ogrn = (ent.findtext("ogrn") or "").strip()
+        if not ogrn:
+            continue
+        founders = []
+        f_el = ent.find("founders")
+        if f_el is not None:
+            for fo in f_el.findall("founder"):
+                name = (fo.findtext("name") or "").strip()
+                inn = (fo.findtext("inn") or "").strip()
+                if name or inn:
+                    founders.append({"name": name, "inn": inn})
+        cap_raw = (ent.findtext("capital") or "").strip()
+        try:
+            capital = float(cap_raw.replace(",", ".")) if cap_raw else None
+        except ValueError:
+            capital = None
+        out[ogrn] = {
+            "ogrn": ogrn,
+            "name": (ent.findtext("name") or "").strip(),
+            "director": (ent.findtext("director") or "").strip(),
+            "director_inn": (ent.findtext("director_inn") or "").strip(),
+            "address": (ent.findtext("address") or "").strip(),
+            "capital": capital,
+            "founders": founders,
+        }
+    return out
+
+
+class Egrul:
+    def __init__(self, entities: dict[str, dict]):
+        self.entities = entities
+        self.by_inn: dict[str, list[str]] = defaultdict(list)
+        self.by_name_norm: dict[str, list[str]] = defaultdict(list)
+        self.by_name_norm_short: dict[str, list[str]] = defaultdict(list)
+        self.directors_by_inn: dict[str, list[str]] = defaultdict(list)
+        self.founders_by_inn: dict[str, list[str]] = defaultdict(list)
+        self.by_address_norm: dict[str, dict] = {}
+        self.persons_by_org: dict[str, dict[str, dict]] = {}
+        self._build_indexes()
+
+    def _build_indexes(self):
+        for ogrn, e in self.entities.items():
+            if e.get("inn"):
+                self.by_inn[e["inn"]].append(ogrn)
+            nn = norm_name(e.get("name_short") or e.get("name") or e.get("name_full") or "")
+            if nn:
+                self.by_name_norm[nn].append(ogrn)
+            nns = norm_name_short(e.get("name_short") or e.get("name") or e.get("name_full") or "")
+            if nns:
+                self.by_name_norm_short[nns].append(ogrn)
+
+            addr_norm = norm_address(e.get("address") or "")
+            if addr_norm:
+                if addr_norm not in self.by_address_norm:
+                    self.by_address_norm[addr_norm] = {
+                        "display": e["address"],
+                        "kind": address_kind(addr_norm),
+                        "ogrns": [],
+                    }
+                self.by_address_norm[addr_norm]["ogrns"].append(ogrn)
+
+            persons: dict[str, dict] = {}
+            d_fio = norm_fio(e.get("director") or "")
+            d_inn = (e.get("director_inn") or "").strip()
+            if d_inn and d_fio:
+                persons[d_inn] = {"fio": d_fio, "role": "директор"}
+                self.directors_by_inn[d_inn].append(ogrn)
+            for f in e.get("founders") or []:
+                f_inn = (f.get("inn") or "").strip()
+                f_fio = norm_fio(f.get("name") or "")
+                if not f_inn or not f_fio:
+                    continue
+                if f_inn in persons:
+                    if persons[f_inn]["role"] == "директор":
+                        persons[f_inn]["role"] = "директор, учредитель"
+                else:
+                    persons[f_inn] = {"fio": f_fio, "role": "учредитель"}
+                self.founders_by_inn[f_inn].append(ogrn)
+            self.persons_by_org[ogrn] = persons
+
+    def display_name(self, ogrn: str) -> str:
+        e = self.entities.get(ogrn)
+        if not e:
+            return ogrn
+        return e.get("name_short") or e.get("name") or e.get("name_full") or ogrn
+
+    def display_form(self, ogrn: str) -> str:
+        e = self.entities.get(ogrn)
+        if not e:
+            return "?"
+        return compute_form(e.get("name_short") or e.get("name") or e.get("name_full") or "")
+
+    def find_by_org_name(self, org: str) -> str | None:
+        if not org:
+            return None
+        n = norm_name(org)
+        if n in self.by_name_norm and len(self.by_name_norm[n]) == 1:
+            return self.by_name_norm[n][0]
+        nns = norm_name_short(org)
+        if nns in self.by_name_norm_short and len(self.by_name_norm_short[nns]) == 1:
+            return self.by_name_norm_short[nns][0]
+        return None
+
+    def neighbors_by_person(self, ogrn: str) -> dict[str, dict]:
+        result: dict[str, dict] = {}
+        persons = self.persons_by_org.get(ogrn, {})
+        for inn, p in persons.items():
+            for nb in self.directors_by_inn.get(inn, []):
+                if nb == ogrn:
+                    continue
+                self._add_neighbor(result, nb, p["fio"], inn, "директор")
+            for nb in self.founders_by_inn.get(inn, []):
+                if nb == ogrn:
+                    continue
+                self._add_neighbor(result, nb, p["fio"], inn, "учредитель")
+        return result
+
+    def _add_neighbor(self, result, nb_ogrn, fio, inn, role):
+        if nb_ogrn not in result:
+            result[nb_ogrn] = {"org": self.entities[nb_ogrn], "persons": []}
+        item = result[nb_ogrn]
+        if not any(pp["inn"] == inn and pp["role"] == role for pp in item["persons"]):
+            item["persons"].append({"fio": fio, "inn": inn, "role": role})
+
+    def address_neighbors(self, ogrn: str) -> dict | None:
+        e = self.entities.get(ogrn)
+        if not e:
+            return None
+        addr_norm = norm_address(e.get("address") or "")
+        if not addr_norm:
+            return None
+        bucket = self.by_address_norm.get(addr_norm)
+        if not bucket:
+            return None
+        others = [o for o in bucket["ogrns"] if o != ogrn]
+        if not others:
+            return None
+        return {
+            "display": bucket["display"],
+            "kind": bucket["kind"],
+            "ogrns": others,
+        }
+
+
+def load_egrul(filter_by_act: bool = True) -> Egrul:
+    s212 = parse_212(XML_212)
+    sdeep = parse_deep(XML_DEEP)
+    merged: dict[str, dict] = {}
+    for ogrn, e212 in s212.items():
+        ed = sdeep.get(ogrn, {})
+        merged[ogrn] = {**e212, **{k: v for k, v in ed.items() if k != "ogrn"}}
+    for ogrn, ed in sdeep.items():
+        if ogrn not in merged:
+            merged[ogrn] = ed
+    if filter_by_act:
+        act = set(load_act_ogrns())
+        merged = {o: e for o, e in merged.items() if o in act}
+    return Egrul(merged)
+
+
+# ============================================================
+# ПАРСЕР contracts*.log
+# ============================================================
+RE_SCR = r"scr(?:\d{6}|XXXXXX)\.png"
+RE_LINE1 = re.compile(
+    r"^(" + RE_SCR + r")\s*-\s*(.+?)\s*--\s*(.+?)\s*---\s*(.+?)\s*----\s*(.+)$"
+)
+RE_LINE2 = re.compile(
+    r"^(" + RE_SCR + r")\s*-\s*(\([^)]*\)-[^=]*=-?[\d.,]+)\s*--\s*(.*)$"
+)
 RE_LINE3 = re.compile(r"^(" + RE_SCR + r")\s*-\s*(.+)$")
 RE_LINE4_SCR = re.compile(r"^(" + RE_SCR + r")\s*$")
-RE_DATE_DDMMYYYY = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
-RE_FILENAME_OGRN = re.compile(r"^contracts(\d{10,})\.log$")
-RE_SCR_IN_ERRLOG = re.compile(r"(scr\d{6}\.png)")
 
-def _iter_contract_files(): return sorted(LOG_DIR.glob("contracts*.log"), key=lambda p: p.name)
+RE_DELTA = re.compile(r"\(([\d.,]+)\)-([\d.,]+)=(-?[\d.,]+)")
+RE_FILENAME_OGRN = re.compile(r"^contracts(\d{10,})\.log$")
+
+
+def _iter_contract_files():
+    return sorted(LOG_DIR.glob("contracts*.log"), key=lambda p: p.name)
+
+
 def _extract_ogrn(filename: str) -> str:
     m = RE_FILENAME_OGRN.match(filename)
     return m.group(1) if m else ""
 
-def _is_holiday(date_str: str) -> bool:
-    if not date_str: return False
-    m = RE_DATE_DDMMYYYY.match(date_str.strip())
-    if not m: return False
-    try: d = _date(int(m.group(3)), int(m.group(2)), int(m.group(1)))
-    except Exception: return False
-    if _HAS_HOLIDAYS and RU_HOLIDAYS is not None:
-        try:
-            if d in RU_HOLIDAYS: return True
-        except Exception: pass
-    if d.weekday() >= 5: return True
-    return False
+
+def _parse_delta(s: str) -> float | None:
+    m = RE_DELTA.search(s or "")
+    if not m:
+        return None
+    try:
+        return round(float(m.group(3).replace(",", ".")), 2)
+    except ValueError:
+        return None
+
 
 def _is_real_scr(name: str) -> bool:
-    return bool(re.match(r"^scr\d{6}\.png$", name)) if name else False
+    return bool(name) and bool(re.match(r"^scr\d{6}\.png$", name))
 
-def parse_contracts_logs():
-    records = []
+
+def parse_contracts_logs(egrul: Egrul | None) -> list[dict]:
+    records: list[dict] = []
+    seen_keys: set[tuple[str, str]] = set()
+
     for path in _iter_contract_files():
         ogrn = _extract_ogrn(path.name)
-        if ogrn in BLACKLIST_OGRN: continue
-        try: file_mtime = path.stat().st_mtime
-        except Exception: file_mtime = 0.0
-        text = path.read_text(encoding="utf-8")
+        text = path.read_text(encoding="utf-8", errors="replace")
         blocks = re.split(r"\r?\n\r?\n", text.strip())
         for block in blocks:
             lines = [ln.rstrip() for ln in block.splitlines() if ln.strip()]
-            if len(lines) < 3: continue
+            if len(lines) < 3:
+                continue
+
             m1 = RE_LINE1.match(lines[0].strip())
-            if not m1: continue
-            scr_a, org, addr, pdf_name, date_str = m1.groups()
-            org_clean = (org or "").strip()
-            if (not org_clean) or (org_clean == "Адрес дома:") or (org_clean == "?"): continue
-            if "Тюмен" in addr.upper() or addr.strip().startswith("626"): continue
-            org = org_clean.upper()
+            if not m1:
+                continue
+            scr_a, org, addr, pdf_label, date_str = m1.groups()
+            org = org.strip()
+            if not org:
+                continue
+
             m2 = RE_LINE2.match(lines[1].strip())
-            if not m2: continue
-            scr_b, ep_name = m2.group(1), m2.group(3)
+            if not m2:
+                continue
+            scr_b, delta_str, synopsis = m2.groups()
+
             m3 = RE_LINE3.match(lines[2].strip())
-            if not m3: continue
+            if not m3:
+                continue
             scr_c, marker = m3.groups()
+            marker = marker.strip()
+
             screens = [scr_a, scr_b, scr_c]
             for ln in lines[3:]:
-                m = RE_LINE4_SCR.match(ln.strip())
-                if m: screens.append(m.group(1))
-            
-            has_real_screens = any(_is_real_scr(s) for s in screens)
-            hol = _is_holiday(date_str)
-            
-            records.append({
-                "src": path.name, "ogrn": ogrn, "scr_a": scr_a, "org": org,
-                "addr": addr, "pdf_name": pdf_name, "date": date_str,
-                "scr_b": scr_b, "ep_name": ep_name, "scr_c": scr_c, "marker": marker,
-                "marker_long": MARKER_LONG.get(marker, marker), "screens": screens,
-                "has_real_screens": has_real_screens,
-                "scr_pdf": screens[3] if len(screens) > 3 else "",
-                "is_holiday": hol, "_mtime": file_mtime,
-                "total_area": 0.0, "living_area": 0.0, "non_living_area": 0.0,
-                "odi_delta": 0.0, "house_url": "", "found_ogrn": "", "is_mismatch": False
-            })
-            
-    best = {}
-    for r in records:
-        key = ((r["org"] or "").strip().lower(), (r["addr"] or "").strip().lower())
-        cur = best.get(key)
-        if cur is None or r["_mtime"] > cur["_mtime"]: best[key] = r
-    result = []
-    for r in records:
-        key = ((r["org"] or "").strip().lower(), (r["addr"] or "").strip().lower())
-        if best.get(key) is r:
-            r.pop("_mtime", None)
-            result.append(r)
-    return result
+                m4 = RE_LINE4_SCR.match(ln.strip())
+                if m4:
+                    screens.append(m4.group(1))
 
-# ============================== ПАРСИНГ gisjkh-ufo*.log ==============================
+            delta_value = _parse_delta(delta_str)
+
+            org_norm = norm_name(org)
+            addr_norm = norm_address(addr)
+            key = (org_norm, addr_norm)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+
+            org_ogrn = egrul.find_by_org_name(org) if egrul else None
+
+            records.append({
+                "src": path.name,
+                "ogrn": ogrn,
+                "org": org,
+                "org_norm": org_norm,
+                "org_ogrn_egrul": org_ogrn,
+                "addr": addr,
+                "addr_norm": addr_norm,
+                "pdf_label": pdf_label,
+                "date": date_str,
+                "scr_a": scr_a,
+                "scr_b": scr_b,
+                "scr_c": scr_c,
+                "screens": screens,
+                "has_real_screens": any(_is_real_scr(s) for s in screens),
+                "marker": marker,
+                "marker_long": MARKER_LONG.get(marker, marker),
+                "delta_value": delta_value,
+                "delta_str": delta_str,
+                "synopsis": synopsis.strip(),
+                "is_holiday": is_holiday(date_str),
+            })
+    return records
+
+
+# ============================================================
+# ПАРСЕР gisjkh-ufo*.log
+# ============================================================
 RE_HOUSE_INFO = re.compile(
     r"house_info:\s+"
-    r"(?=.*?\borg='([^']*)')"
-    r"(?=.*?\baddr='([^']*)')"
-    r"(?=.*?\bpdf='([^']*)')"
-    r"(?=.*?\bdate='([^']*)')"
+    r"org='([^']*)'\s+"
+    r"addr='([^']*)'\s+"
+    r"pdf='([^']*)'\s+"
+    r"real='([^']*)'\s+"
+    r"date='([^']*)'\s+"
+    r"pdf_icons=(\d+)"
 )
-RE_RESULT_MARKER = re.compile(r"result_text:\s*'([^']*)'\s+marker:\s*'([^']*)'")
-RE_RESULT_NONE = re.compile(r"result_text:\s*'ДЕЙСТВИТЕЛЬНА'\s+marker:\s*None")
+RE_RESULT_MARKER = re.compile(
+    r"result_text:\s*'([^']*)'\s+marker:\s*'([^']*)'"
+)
+RE_RESULT_NONE = re.compile(
+    r"result_text:\s*'ДЕЙСТВИТЕЛЬНА'\s+marker:\s*None"
+)
+RE_RESULT_LINE = re.compile(r"\[result\]\s*(.+?)\s*\|\s*(.+?)\s*\|\s*(.+?)\s*$")
+RE_SQUARES = re.compile(r"\[squares-(card|final)\]\s+total='([^']*)'\s+res='([^']*)'")
+RE_COLLAGE_PAGES = re.compile(r"\[collage\]\s+страниц в PDF:\s*(\d+),\s*берём idx=\[([^\]]*)\]")
+RE_COLLAGE_OCR = re.compile(r"\[collage\]\s+стр\.(\d+):\s+OCR\s+(\d+)\s+симв\.")
+RE_CONTRACT_LOG_EO = re.compile(
+    r"\[contract-log-EO\]\s+written:\s*(" + RE_SCR + r")\s*-\s*(\w+)\s*\|\s*delta=(\S+)"
+)
 
-def _iter_gisjkh_files(): return sorted(LOG_DIR.glob("gisjkh-ufo*.log"), key=lambda p: p.name)
 
-def parse_gisjkh_logs():
-    stats = {}
+def _iter_gisjkh_files():
+    return sorted(LOG_DIR.glob("gisjkh-ufo*.log"), key=lambda p: p.name)
+
+
+def parse_gisjkh_logs() -> dict[str, dict]:
+    stats: dict[str, dict] = {}
+
     for path in _iter_gisjkh_files():
-        current_org = None
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                m_hi = RE_HOUSE_INFO.search(line)
-                if m_hi:
-                    current_org = m_hi.group(1).strip().upper()
-                    continue
-                m_res = RE_RESULT_MARKER.search(line)
-                if m_res and current_org:
-                    marker = m_res.group(2).strip()
-                    if marker in ("Н", "Ж"): _bump(stats, current_org, marker)
-                    current_org = None
-                    continue
-                if RE_RESULT_NONE.search(line) and current_org:
-                    _bump(stats, current_org, "Д")
-                    current_org = None
-                    continue
+        m = re.match(r"^gisjkh-ufo(\d{10,})\.log$", path.name)
+        if not m:
+            continue
+        ogrn = m.group(1)
+        s = stats.setdefault(ogrn, {
+            "ogrn": ogrn,
+            "houses": 0,
+            "markers": defaultdict(int),
+            "tech": defaultdict(int),
+            "fallback_ok": 0,
+            "squares": {},
+        })
+
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.rstrip()
+
+            m_hi = RE_HOUSE_INFO.search(line)
+            if m_hi:
+                s["houses"] += 1
+                continue
+
+            m_res = RE_RESULT_MARKER.search(line)
+            if m_res:
+                _txt, marker = m_res.group(1).strip(), m_res.group(2).strip()
+                if marker in ("Н", "Ж", "Э", "О"):
+                    s["markers"][marker] += 1
+                continue
+
+            if RE_RESULT_NONE.search(line):
+                s["markers"]["Д"] += 1
+                continue
+
+            m_res_line = RE_RESULT_LINE.search(line)
+            if m_res_line:
+                a, b, c = (m_res_line.group(1).strip(),
+                           m_res_line.group(2).strip(),
+                           m_res_line.group(3).strip())
+                for seg in (a, b, c):
+                    seg_up = seg.upper()
+                    for tk in TECH_FAIL_MARKERS:
+                        if tk in seg_up:
+                            s["tech"][tk] += 1
+                            break
+                    for tk in TECH_OK_MARKERS:
+                        if tk in seg_up:
+                            s["fallback_ok"] += 1
+                            break
+                continue
+
+            m_eo = RE_CONTRACT_LOG_EO.search(line)
+            if m_eo:
+                continue
+
+            m_sq = RE_SQUARES.search(line)
+            if m_sq:
+                kind, total, res = m_sq.groups()
+                if kind == "final":
+                    s["squares"] = {"total": total, "res": res}
+                continue
+
     return stats
 
-def _bump(stats: dict, org: str, marker: str):
-    if org not in stats: stats[org] = {"total": 0, "Д": 0, "Н": 0, "Ж": 0}
-    stats[org]["total"] += 1
-    stats[org][marker] = stats[org].get(marker, 0) + 1
 
-# ============================== МАССОВЫЕ ДАТЫ ==============================
-def compute_mass_date_per_org(records):
-    counts_per_org = {}
+# ============================================================
+# АНАЛИТИКА
+# ============================================================
+def compute_mass_dates(records: list[dict]) -> dict[str, dict]:
+    counts_per_org: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    order_per_org: dict[str, list[str]] = defaultdict(list)
     for r in records:
-        org = r["org"]
+        org = r["org_norm"]
         date = (r["date"] or "").strip()
-        if not RE_DATE_DDMMYYYY.match(date): continue
-        if org not in counts_per_org: counts_per_org[org] = {}
-        counts_per_org[org][date] = counts_per_org[org].get(date, 0) + 1
+        if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", date):
+            continue
+        if date not in counts_per_org[org]:
+            order_per_org[org].append(date)
+        counts_per_org[org][date] += 1
 
-    result = {}
+    result: dict[str, dict] = {}
     for org, counts in counts_per_org.items():
-        mass = {d: c for d, c in counts.items() if c >= MASS_DATE_MIN}
-        if mass: result[org] = mass
+        mass = [(d, c) for d, c in counts.items() if c >= MASS_DATE_MIN]
+        if not mass:
+            continue
+        max_count = max(c for _, c in mass)
+        for d in order_per_org[org]:
+            if counts.get(d) == max_count and counts[d] >= MASS_DATE_MIN:
+                is_joke = d[:5] in MASS_JOKE_DATES
+                result[org] = {"date": d, "count": max_count, "is_joke": is_joke}
+                break
     return result
 
-# ============================== НОРМАЛИЗАЦИЯ И ПРИВЯЗКА Д ==============================
-def _norm_org(s: str) -> str:
-    if not s: return ""
-    s = s.upper().strip().replace("«", '"').replace("»", '"').replace("<", '"').replace(">", '"')
-    return re.sub(r"\s+", " ", s)
 
-def _norm_addr(s: str) -> str: return (s or "").strip()
+def compute_org_summary(
+    records: list[dict],
+    egrul: Egrul | None,
+    gisjkh_stats: dict[str, dict],
+    mass_dates: dict[str, dict],
+) -> dict[str, dict]:
+    summary: dict[str, dict] = {}
 
-def _match_d_per_org(records, org_stats):
-    org_stats_norm = {_norm_org(raw_org): st for raw_org, st in org_stats.items()}
-    addr_to_orgs = {}
     for r in records:
-        addr_to_orgs.setdefault(_norm_addr(r["addr"]), set()).add(_norm_org(r["org"]))
-    result = {}
-    for r in records:
-        raw_org, o_norm, a_norm = r["org"], _norm_org(r["org"]), _norm_addr(r["addr"])
-        st = org_stats_norm.get(o_norm)
-        d_here = st.get("Д", 0) if st else 0
-        if d_here == 0:
-            orgs = addr_to_orgs.get(a_norm, set())
-            if len(orgs) == 1:
-                st2 = org_stats_norm.get(next(iter(orgs)))
-                if st2: d_here = st2.get("Д", 0)
-        result[raw_org] = max(result.get(raw_org, 0), d_here)
-    return result
-
-# ============================== СВОДКА ПО УК ==============================
-def compute_org_summary(records, org_stats, mass_per_org, egrul_directors):
-    summary = {}
-    for r in records:
-        org = r["org"]
+        org = r["org_norm"]
         if org not in summary:
             summary[org] = {
-                "org": org, "addr_count": 0, "n_count": 0, "j_count": 0,
-                "e_count": 0, "o_count": 0, "mass_date": "", "mass_count": 0,
-                "mass_dates": {}, "trust": 0.0, "holiday_count": 0,
-                "ogrns": [], "director": "",
-                "odi_neg_count": 0, "odi_neg_sum": 0.0
+                "org": r["org"],
+                "org_norm": org,
+                "org_ogrn_egrul": r.get("org_ogrn_egrul"),
+                "addr_count": 0,
+                "n_count": 0, "j_count": 0, "e_count": 0, "o_count": 0, "d_count": 0,
+                "mass_date": "", "mass_count": 0, "mass_joke": False,
+                "trust": 0.0,
+                "neg_count": 0, "neg_sum": 0.0,
+                "holiday_count": 0,
+                "low_capital": False,
+                "ghost_uk": False,
+                "tech_fail_count": 0,
+                "ogrns": set(),
             }
         s = summary[org]
         s["addr_count"] += 1
-        if r["marker"] == "Н": s["n_count"] += 1
-        elif r["marker"] == "Ж": s["j_count"] += 1
-        elif r["marker"] == "Э": s["e_count"] += 1
-        elif r["marker"] == "О": s["o_count"] += 1
+        marker = r["marker"]
+        if marker == "Н": s["n_count"] += 1
+        elif marker == "Ж": s["j_count"] += 1
+        elif marker == "Э": s["e_count"] += 1
+        elif marker == "О": s["o_count"] += 1
+        if r.get("org_ogrn_egrul"):
+            s["ogrns"].add(r["org_ogrn_egrul"])
+        dv = r.get("delta_value")
+        if dv is not None and dv < 0:
+            s["neg_count"] += 1
+            s["neg_sum"] += dv
+        if r.get("is_holiday"):
+            s["holiday_count"] += 1
 
-        ogrn = r.get("ogrn") or ""
-        if ogrn and ogrn not in s["ogrns"]: s["ogrns"].append(ogrn)
+    if egrul:
+        for ogrn, gs in gisjkh_stats.items():
+            name = egrul.display_name(ogrn)
+            key = norm_name(name)
+            if key in summary:
+                summary[key]["d_count"] = gs["markers"].get("Д", 0)
 
-        odi = r.get("odi_delta", 0.0)
-        if odi < -0.01:
-            s["odi_neg_count"] += 1
-            s["odi_neg_sum"] += odi
-                
-        if r.get("is_holiday"): s["holiday_count"] += 1
-
-    d_per_org = _match_d_per_org(records, org_stats)
     for org, s in summary.items():
-        d = d_per_org.get(org, 0)
-        denominator = d + s["n_count"] + s["j_count"] + s["e_count"] + s["o_count"]
-        if denominator > 0: s["trust"] = round(d / denominator * 100, 1)
-        else: s["trust"] = 0.0
+        d = s["d_count"]
+        n, j, e, o = s["n_count"], s["j_count"], s["e_count"], s["o_count"]
+        denom = d + n + j + e + o
+        s["trust"] = round(d / denom * 100, 1) if denom else 0.0
+        s["neg_sum"] = round(s["neg_sum"], 2)
+        if org in mass_dates:
+            m = mass_dates[org]
+            s["mass_date"] = m["date"]
+            s["mass_count"] = m["count"]
+            s["mass_joke"] = m["is_joke"]
 
-        mass = mass_per_org.get(org)
-        if mass:
-            max_date = max(mass.items(), key=lambda kv: kv[1])
-            s["mass_date"] = max_date[0]
-            s["mass_count"] = max_date[1]
-            s["mass_dates"] = mass
+        if egrul and s["ogrns"]:
+            ogrn = sorted(s["ogrns"])[0]
+            ent = egrul.entities.get(ogrn)
+            if ent:
+                if (ent.get("status") or "") == "terminated":
+                    s["ghost_uk"] = True
+                if ent.get("capital") is not None and abs(ent["capital"] - LOW_CAPITAL_VALUE) < 0.5:
+                    s["low_capital"] = True
 
-        s["ogrns"] = sorted(s["ogrns"])[:1]
-        if s["ogrns"]: s["director"] = egrul_directors.get(s["ogrns"][0], "")
+        if egrul and s["ogrns"]:
+            ogrn = sorted(s["ogrns"])[0]
+            gs = gisjkh_stats.get(ogrn)
+            if gs:
+                s["tech_fail_count"] = sum(gs["tech"].values())
+
     return summary
 
-# ============================== HTML-ШАБЛОН ==============================
+
+# ============================================================
+# NPA_LIST
+# ============================================================
+NPA_TEXT = """Перечень нормативных правовых актов, использованных при подготовке отчёта
+
+1. Конституция Российской Федерации.
+2. Жилищный кодекс Российской Федерации.
+3. Гражданский кодекс Российской Федерации (ст. 160, 432, 388, 391, 1102).
+4. Федеральный закон от 21.07.2014 № 209-ФЗ «О государственной информационной системе жилищно-коммунального хозяйства» (п. 8 ст. 4, п. 4 ст. 5).
+5. Федеральный закон от 27.07.2006 № 149-ФЗ «Об информации, информационных технологиях и о защите информации» (ч. 9 ст. 14).
+6. Федеральный закон от 06.04.2011 № 63-ФЗ «Об электронной подписи».
+7. Кодекс Российской Федерации об административных правонарушениях (ст. 20.4).
+8. Уголовный кодекс Российской Федерации (ст. 159, 159.2, 272, 327).
+9. Постановление Правительства РФ от 13.08.2006 № 491 «Об утверждении Правил содержания общего имущества в многоквартирном доме…».
+10. Постановление Правительства РФ от 06.05.2011 № 354 «О предоставлении коммунальных услуг собственникам и пользователям помещений…».
+"""
+
+
+# ============================================================
+# DOWNLOAD_ERRORS
+# ============================================================
+DL_HEADER = (
+    "Лог сбоев при скачивании с портала ГИС ЖКХ.\n"
+    "Лог относителен. При размере файла > 40 МБ допускаются таймауты и повторные попытки.\n"
+    "Формат: <таймстамп> - <ОГРН> -- <ЮЛ> --- <адрес> ---- <файл> ----- <url> ------ <тип> ------- download error\n"
+    "----------------------------------------------------------------------------------------------------\n"
+)
+
+
+# ============================================================
+# HTML-ШАБЛОН
+# ============================================================
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Отчёт по проверке квалифицированной ЭП договоров УК</title>
+<title>Отчёт по проверке ЭП договоров УК</title>
 <style>
-  body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
-         margin: 20px; background: #f5f5f5; color: #222; }
-  h1 { font-size: 20px; margin-bottom: 10px; }
-  .meta { color: #666; font-size: 13px; margin-bottom: 16px; line-height: 1.5; }
-  .legal { color: #444; font-size: 12px; margin-top: 24px; line-height: 1.55;
-           border-top: 1px solid #ddd; padding-top: 12px; }
-  .legal h2 { font-size: 14px; margin: 0 0 8px 0; }
-  .legal ul { margin: 0 0 8px 0; padding-left: 20px; }
-  table { border-collapse: collapse; background: #fff; width: 100%;
-          box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+         margin: 0; padding: 20px; background: #f5f5f5; color: #222;
+         font-size: 13px; line-height: 1.5; }
+  h1 { font-size: 20px; margin: 0 0 8px 0; }
+  h2 { font-size: 15px; margin: 18px 0 8px 0; }
+  .meta { color: #666; font-size: 12px; margin-bottom: 16px; }
+
+  blockquote.epigraph {
+    text-align: right;
+    margin: 24px 40px 24px auto;
+    max-width: 720px;
+    font-size: 13px;
+    line-height: 1.55;
+    color: #333;
+    border-left: none;
+    padding: 0;
+  }
+  blockquote.epigraph p { margin: 0 0 10px 0; }
+  blockquote.epigraph b { color: #000; font-size: 13.5px; }
+  blockquote.epigraph i { font-style: italic; color: #555; }
+
+  table.main-table { border-collapse: collapse; background: #fff; width: 100%;
+          box-shadow: 0 1px 4px rgba(0,0,0,0.1); margin-top: 16px; }
   th, td { border: 1px solid #ddd; padding: 6px 8px; font-size: 13px;
            vertical-align: top; }
-  th { background: #eaeaea; cursor: pointer; user-select: none;
-       position: sticky; top: 0; }
-  th:hover { background: #ddd; }
-  th .arrow { color: #999; font-size: 11px; margin-left: 4px; }
+  th { background: #eaeaea; position: sticky; top: 0; cursor: pointer; user-select: none; }
   th.no-sort { cursor: default; }
-  th.no-sort:hover { background: #eaeaea; }
-  th.col-toggle { width: 28px; cursor: default; }
-  th.col-toggle:hover { background: #eaeaea; }
+  th .arrow { color: #888; font-size: 11px; margin-left: 4px; }
 
   tr.org-row td { background: #f3f3f3; font-weight: 600; }
-  tr.org-row:hover td { background: #ececec; }
   tr.org-row td.org-cell { white-space: normal; }
+  td.org-cell .org-name { display: block; font-weight: 600; }
+  td.org-cell .org-ogrn { display: block; font-weight: 400; color: #555;
+                           font-size: 11px; font-variant-numeric: tabular-nums; }
+  td.org-cell .org-score { display: block; font-weight: 700; text-align: right;
+                            font-variant-numeric: tabular-nums; }
 
-  td.org-cell .org-name { display: block; text-align: left; font-weight: 600; cursor: help; }
-  td.org-cell .org-ogrn {
-      display: block; text-align: left; font-weight: 400; color: #555;
-      font-size: 11px; font-variant-numeric: tabular-nums; margin-top: 2px;
-  }
-  td.org-cell .org-director { cursor: help; }
-  td.org-cell .org-score {
-      display: block; text-align: right; font-weight: 700;
-      font-variant-numeric: tabular-nums;
-  }
-  td.toggle-cell {
-      text-align: center; vertical-align: middle; cursor: pointer;
-      user-select: none; font-weight: bold; font-size: 16px; width: 28px;
-  }
+  td.toggle-cell { text-align: center; vertical-align: middle; cursor: pointer;
+                    user-select: none; font-weight: bold; font-size: 16px; width: 28px; }
   td.toggle-cell:hover { background: #dcdcdc; }
-  
-  td.mass-date { font-weight: 600; }
-  td.mass-date .mass-date-text { cursor: help; }
-  
-  td.holiday-date { color: #b00; font-weight: bold; }
-  td.marker-zh  { color: #b00; font-weight: bold; }
-  td.marker-n   { color: #d68000; font-weight: bold; }
-  td.marker-other { color: #333; font-weight: bold; }
-  .n-counter { color: #d68000; font-weight: bold; }
-  .j-counter { color: #b00; font-weight: bold; margin-left: 14px; }
-  .e-counter { color: #333; font-weight: bold; margin-left: 14px; }
-  .o-counter { color: #333; font-weight: bold; margin-left: 14px; }
-  
-  .area-total { color: #0b5cad; font-weight: bold; }
-  .area-living { color: #147a29; font-weight: bold; }
-  .area-nonliving { color: #d68000; font-weight: bold; }
-  .area-result { color: #b00; font-weight: bold; }
-  
-  sub { font-size: 85%; }
-  
-  a.addr-link { color: inherit; text-decoration: none; display: inline-block; }
-  a.addr-link:hover { color: #0b5cad; text-decoration: underline; }
 
-  td.addr-cell {
-      display: flex; justify-content: space-between;
-      align-items: flex-start; gap: 12px;
-  }
+  td.mass-date { font-weight: 600; }
+  td.mass-date .mass-hint { display: block; font-weight: 400; font-size: 11px; color: #555; }
+
+  td.holiday-date { color: #b00; font-weight: bold; }
+  td.marker-zh { color: #b00; font-weight: bold; }
+  td.marker-n  { color: #d68000; font-weight: bold; }
+  td.marker-d  { color: #0a7a2a; font-weight: bold; }
+  td.marker-other { color: #333; font-weight: bold; }
+
+  .n-counter { color: #d68000; font-weight: bold; }
+  .j-counter { color: #b00; font-weight: bold; margin-left: 10px; }
+  .e-counter { color: #333; font-weight: bold; margin-left: 10px; }
+  .o-counter { color: #333; font-weight: bold; margin-left: 10px; }
+
+  td.addr-cell { display: flex; justify-content: space-between;
+                  align-items: flex-start; gap: 12px; }
   td.addr-cell .addr-text { flex: 1 1 auto; }
-  td.addr-cell .addr-delta {
-      flex: 0 0 auto; font-weight: bold;
-      font-variant-numeric: tabular-nums; white-space: nowrap;
-      text-align: right;
-  }
+  td.addr-cell .addr-delta { flex: 0 0 auto; color: #b00; font-weight: bold;
+                             font-variant-numeric: tabular-nums; text-align: right; }
 
   tr.house-row { display: none; }
   tr.house-row.visible { display: table-row; }
   tr.house-row td.house-addr { padding-left: 32px; }
+
   .btn-view {
     display: inline-block; padding: 4px 10px; cursor: pointer;
     border: 1px solid #888; border-radius: 4px; background: #f0f0f0;
     font-size: 12px; user-select: none;
   }
   .btn-view:hover { background: #e0e0e0; }
+
   #overlay {
     position: fixed; inset: 0; background: rgba(0,0,0,0.92);
-    display: none; z-index: 9999; align-items: center; justify-content: center;
+    display: none; z-index: 9999;
+    align-items: center; justify-content: center;
   }
   #overlay.open { display: flex; }
   #overlay .frame {
     position: relative; max-width: 95vw; max-height: 95vh;
-    width: 95vw; height: 95vh; display: flex; align-items: center; justify-content: center;
+    width: 95vw; height: 95vh;
+    display: flex; align-items: center; justify-content: center;
   }
   #overlay img {
-    max-width: 100%; max-height: 100%; position: absolute; opacity: 0;
-    transition: opacity 0.25s; object-fit: contain; user-select: none;
+    max-width: 100%; max-height: 100%;
+    position: absolute; opacity: 0;
+    transition: opacity 0.25s; object-fit: contain;
+    user-select: none;
   }
   #overlay img.active { opacity: 1; }
   #overlay .close {
-    position: absolute; top: 12px; right: 16px; color: #fff; font-size: 28px;
-    cursor: pointer; background: rgba(0,0,0,0.4); border-radius: 50%;
+    position: absolute; top: 12px; right: 16px;
+    color: #fff; font-size: 28px; cursor: pointer;
+    background: rgba(0,0,0,0.4); border-radius: 50%;
     width: 40px; height: 40px; line-height: 36px; text-align: center;
     user-select: none;
   }
   #overlay .close:hover { background: rgba(255,255,255,0.2); }
   #overlay .caption {
-    position: absolute; left: 16px; bottom: 12px; color: #ddd; font-size: 13px;
-    font-family: monospace; background: rgba(0,0,0,0.5); padding: 6px 10px; border-radius: 4px;
+    position: absolute; left: 16px; bottom: 12px;
+    color: #ddd; font-size: 13px; font-family: monospace;
+    background: rgba(0,0,0,0.5); padding: 6px 10px; border-radius: 4px;
   }
-  #overlay .caption #ov_filename {
-    display: block; color: #fff; font-weight: bold; margin-top: 4px;
+  #overlay .paused-badge {
+    position: absolute; top: 12px; left: 16px;
+    color: #fff; font-size: 13px; font-family: monospace;
+    background: rgba(180, 0, 0, 0.8); padding: 4px 10px;
+    border-radius: 4px; display: none;
   }
+  #overlay.paused .paused-badge { display: block; }
 
-  #hint-tooltip {
-    position: fixed; display: none; z-index: 10000;
-    background: #ffffff; color: #333; border: 1px solid #ccc;
-    border-radius: 4px; padding: 8px 10px; font-size: 11px;
-    line-height: 1.4; max-width: 350px;
-    box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+  .tip {
+    position: fixed;
+    z-index: 10000;
+    background: #ffffff;
+    color: #222;
+    border: 1px solid #c8c8c8;
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: "Consolas", "Courier New", monospace;
+    font-size: 7pt;
+    line-height: 1.4;
+    max-width: 95vw;
+    box-shadow: 0 6px 22px rgba(0,0,0,0.18);
     pointer-events: none;
+    display: none;
+    overflow: hidden;
   }
-  
-  tr.total-row td {
-      background: #fafafa;
-      border-top: 2px solid #888;
-      font-weight: normal;
+  .tip.open { display: block; }
+  .tip .title {
+    color: #0b5cad; font-weight: 700;
+    margin-bottom: 3px;
+    font-family: -apple-system, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size: 7pt;
   }
+  .tip .sect {
+    color: #666; font-weight: 600;
+    margin: 3px 0 1px 0;
+    font-size: 7pt;
+  }
+  .tip .line { white-space: pre; color: #222; font-size: 7pt; }
+  .tip .who { color: #444; white-space: pre; font-size: 7pt; }
+
+  .legal { color: #444; font-size: 12px; margin-top: 32px; line-height: 1.55;
+           border-top: 1px solid #ddd; padding-top: 12px; }
+  .legal h2 { font-size: 14px; margin: 0 0 8px 0; }
+  .legal ul { margin: 0 0 8px 0; padding-left: 20px; }
 </style>
 </head>
 <body>
-<h1>Отчёт по проверке квалифицированной Электронной Подписи договоров Управляющих Компаний</h1>
-<div style="margin-bottom:8px;">
-  <button id="btn-expand-all" style="padding: 6px 14px; cursor: pointer; border: 1px solid #888; border-radius: 4px; background: #f0f0f0; font-size: 13px;">Развернуть все</button>
-</div>
+
+<h1>Отчёт по проверке квалифицированной ЭП договоров УК</h1>
+
+<blockquote class="epigraph">
+<p>
+<b>Федеральный закон от 21.07.2014 № 209-ФЗ</b><br>
+«О государственной информационной системе жилищно-коммунального хозяйства»<br>
+<i>п. 8 ст. 4</i> — <i>«…принцип полноты, достоверности, актуальности информации и своевременности её размещения»</i>;<br>
+<i>п. 4 ст. 5</i> — <i>«…достоверной и актуальной информации»</i>.
+</p>
+<p>
+<b>Федеральный закон от 27.07.2006 № 149-ФЗ</b><br>
+«Об информации, информационных технологиях и о защите информации»<br>
+<i>ч. 9 ст. 14</i> — <i>«Информация, содержащаяся в государственных информационных системах, является официальной. Государственные органы… обязаны обеспечить достоверность и актуальность информации…»</i>.
+</p>
+</blockquote>
+
 <div class="meta">
-  Записей: <span id="count">0</span>.<br>
+  Записей: <span id="count">0</span>.
+  <br>
   <b>Расшифровка маркеров столбца «Результат проверки ЭП»:</b>
   <b>Н/Д</b> — подпись верна, но НЕДЕЙСТВИТЕЛЬНА;
   <b>Н/В</b> — подпись НЕВЕРНА и НЕДЕЙСТВИТЕЛЬНА;
   <b>Н/Э</b> — подпись ОТСУТСТВУЕТ;
   <b>Н/О</b> — информация о договоре НЕ РАЗМЕЩЕНА.
-  В отчёт не попадает только Д (подпись ДЕЙСТВИТЕЛЬНА) — Д идёт исключительно в статистику уровня доверия.<br>
-  <b>Уровень доверия</b> по УК = Д / (Д + Н/Д + Н/В + Н/Э + Н/О) × 100%, где Д — дома с действительной ЭП, остальные — из расшифровки выше. Цвет — по тепловой шкале (голубой = высокий, бордовый = низкий). Сортировка по умолчанию — по уровню доверия <b>↑</b> (аутсайдеры сверху).<br>
-  <b>Массовые одинаковые даты заключения договоров</b> (у одной УК, ≥<span id="mass_min">2</span> раз): в свёрнутой строке УК показана дата с максимальным числом повторов, в раскрытых строках домов пастелью подсвечены <b>все</b> такие даты.<br>
-  <b>Формула исчисления площадей в МКД:</b> 
-  <span class="area-result">S<sub>оди</sub> = </span>
-  <span class="area-total">S<sub>общ</sub></span> − 
-  <span class="area-living">S<sub>жил</sub></span> − 
-  <span class="area-nonliving">S<sub>нежил</sub></span> 
-  (ст. 15 ЖК РФ).
-  <br><span class="area-total">S<sub>общ</sub></span> − общая площадь, 
-  <span class="area-living">S<sub>жил</sub></span> − площадь жилых помещений, 
-  <span class="area-nonliving">S<sub>нежил</sub></span> − площадь нежилых помещений.
-  <br>Если результат <b>отрицательный</b>, справа от адреса выводится формула с подставленными цифрами и вопросом <i>«Это S<sub>оди</sub>?»</i>.<br>
-  <b>ОГРН.</b> Если из скана договора удалось распознать иной ОГРН, он выводится серым шрифтом 7pt справа от кнопки «Смотреть».
+  В отчёт не попадает только Д (подпись ДЕЙСТВИТЕЛЬНА) — Д идёт
+  исключительно в статистику уровня доверия.
+  <br>
+  <b>Уровень доверия</b> по УК = Д / (Д + Н/Д + Н/В + Н/Э + Н/О) × 100%,
+  где Д — дома с действительной ЭП, остальные — из расшифровки выше.
+  Цвет — по тепловой шкале (голубой = высокий, бордовый = низкий).
+  Сортировка по умолчанию — по уровню доверия <b>↑</b> (аутсайдеры сверху).
+  <br>
+  <b>Массовые одинаковые даты заключения договоров</b> (у одной УК, ≥2 раз)
+  показаны в свёрнутой строке УК — берётся дата с максимальным
+  числом повторов. Подсвечены пастельным цветом. Строки «Дата отсутствует»
+  и прочие не-даты в подсчёт не входят.
+  <br>
+  <b>Отрицательная площадь</b> (красным справа от адреса) —
+  разница между общей площадью дома и площадью жилых помещений,
+  если она получилась меньше нуля. Показывается как
+  <code>−N м<sup>2</sup></code> и только для таких домов.
+  <br>
+  <b>Красным шрифтом в ячейке даты</b> выделены даты заключения
+  договоров, приходящиеся на выходные или нерабочие праздничные
+  (перенесённые) дни.
+  <br>
+  <b>Констатация ОГРН.</b> ОГРН, указанный рядом с наименованием
+  организации, — это тот ОГРН, по которому производился поиск
+  в ГИС ЖКХ, а не утверждение соответствия данного ЮЛ этому ОГРН.
+  ГИС ЖКХ в отдельных случаях может отдавать по одному ОГРН карточки,
+  ссылающиеся на другое ЮЛ. Мы констатируем результат, полученный
+  от ГИС ЖКХ на момент прогона.
 </div>
 
-<table id="tbl">
+<h2>Сводка по УК</h2>
+
+<button id="btn-expand-all" style="padding: 6px 14px; cursor: pointer;
+        border: 1px solid #888; border-radius: 4px;
+        background: #f0f0f0; font-size: 13px;">Развернуть все</button>
+
+<table class="main-table" id="tbl">
   <thead>
     <tr>
-      <th class="col-toggle"></th>
-      <th data-key="trust">Организации по уровню доверия<span class="arrow"></span></th>
-      <th data-key="addr">Адрес<span class="arrow"></span></th>
-      <th data-key="date">Дата заключения ДУ с УК<span class="arrow"></span></th>
-      <th data-key="marker">Результат проверки ЭП<span class="arrow"></span></th>
-      <th class="no-sort">Протокол проверки</th>
+      <th class="no-sort"></th>
+      <th data-key="trust">УК / ОГРН / форма / % доверия<span class="arrow"></span></th>
+      <th data-key="addr">Адресов<span class="arrow"></span></th>
+      <th data-key="mass">Массовая дата<span class="arrow"></span></th>
+      <th data-key="markers">Маркеры<span class="arrow"></span></th>
+      <th class="no-sort">Аномалии</th>
+      <th class="no-sort">Протокол</th>
     </tr>
   </thead>
   <tbody id="tbody"></tbody>
 </table>
 
-<div style="margin-top:16px;">
-  <a id="btn-download-errors" href="download_errors.log" download="download_errors.log" style="display:inline-block; padding:6px 14px; border:1px solid #888; border-radius:4px; background:#f0f0f0; font-size:13px; text-decoration:none; color:#222;">Скачать лог ошибок</a>
-</div>
-
 <div class="legal">
   <h2>Дисклеймер</h2>
-  <p>Отчёт сформирован автоматически по результатам программного опроса открытых источников — портала ГИС ЖКХ. Единственный источник данных — ГИС ЖКХ на момент прогона. Отчёт не является юридическим заключением и не заменяет собой проверку, проводимую уполномоченными органами.</p>
-  <h2>Возможные правовые последствия выявленных фактов (справочно)</h2>
-  <p>Ниже перечислены нормы, сопоставимые с описанными ситуациями. Формулировки даны в осторожном ключе: факт может содержать признаки соответствующего состава, что устанавливается компетентным органом.</p>
-  <ul>
-    <li>ст. 159, 159.2 УК РФ — мошенничество, в том числе при получении выплат;</li>
-    <li>ст. 272 УК РФ — неправомерный доступ к компьютерной информации;</li>
-    <li>ст. 327 УК РФ — подделка, изготовление или оборот поддельных документов;</li>
-    <li>ст. 20.4 КоАП РФ — нарушение требований пожарной безопасности (в части сопутствующих нарушений);</li>
-    <li>Федеральный закон № 63-ФЗ «Об электронной подписи» — требования к квалифицированной электронной подписи;</li>
-    <li>Постановление Правительства РФ № 491 — Правила содержания общего имущества;</li>
-    <li>Постановление Правительства РФ № 354 — Правила предоставления коммунальных услуг;</li>
-    <li>Жилищный кодекс РФ — требования к раскрытию информации управляющими организациями;</li>
-    <li>ч. 4 ст. 29 Конституции РФ — длящийся ущерб неимущественному праву неопределённого круга лиц на доступ к объективной информации.</li>
-  </ul>
+  <p>
+    Отчёт сформирован автоматически по результатам программного опроса открытых
+    источников — портала ГИС ЖКХ. Единственный источник данных — ГИС ЖКХ на момент
+    прогона. Отчёт не является юридическим заключением и не заменяет проверку,
+    проводимую уполномоченными органами.
+  </p>
+  <p>
+    При подготовке отчёта использовались инструменты на базе искусственного
+    интеллекта. Расчёты площадей, кворумов и иных величин носят оценочный характер.
+  </p>
+
+  <h2>Вилка решений</h2>
+  <p>
+    <b>Вариант А.</b> Устранение выявленных недостатков: размещение достоверных
+    сведений, актуализация сведений об ЭП, повторная публикация.<br>
+    <b>Вариант Б.</b> Отказ от устранения и принятие связанных с этим последствий,
+    включая предусмотренные законом меры реагирования.<br>
+    <b>Вариант В.</b> Игнорирование выявленных фактов и их последующая публикация
+    в открытых источниках.
+  </p>
+
+  <h2>Ссылки</h2>
+  <p>
+    Лог ошибок: <a href="file:///__DL_ERRORS_PATH__">download_errors.log</a><br>
+    Перечень НПА: <a href="file:///__NPA_LIST_PATH__">npa_list.txt</a>
+  </p>
 </div>
 
 <div id="overlay">
   <div class="frame" id="ov_frame">
     <div class="close" onclick="closeOverlay()">×</div>
-    <img id="ov_img0" alt=""><img id="ov_img1" alt=""><img id="ov_img2" alt=""><img id="ov_img3" alt=""><img id="ov_img4" alt="">
-    <div class="caption" id="ov_caption">
-        Для паузы нажми Пробел или тапни по экрану
-        <span id="ov_filename"></span>
-    </div>
+    <div class="paused-badge">ПАУЗА</div>
+    <img id="ov_img0" alt="">
+    <img id="ov_img1" alt="">
+    <img id="ov_img2" alt="">
+    <img id="ov_img3" alt="">
+    <div class="caption" id="ov_caption"></div>
   </div>
 </div>
 
-<div id="hint-tooltip"></div>
+<div class="tip" id="tip"></div>
 
 <script>
 const DATA = __DATA__;
-const ORG_STATS_BACKEND = __ORG_STATS__;
-const ORG_SUMMARY_BACKEND = __ORG_SUMMARY__;
-const EGRUL_ENTITIES = __EGRUL_ENTITIES__;
-const EGRUL_LOST = __EGRUL_LOST__;
-const MASS_DATE_MIN = __MASS_DATE_MIN__;
-const MASS_DATE_HINT = __MASS_DATE_HINT__;
+const ORG_SUMMARY = __ORG_SUMMARY__;
+const TIPS_BY_FIO = __TIPS_BY_FIO__;
+const TIPS_BY_ORG = __TIPS_BY_ORG__;
+const ORG_LIST = __ORG_LIST__;
+const FIO_LIST = __FIO_LIST__;
+const TECH_STATE = __TECH_STATE__;
 
-// ============================================================
-// ИНДЕКСЫ ЕГРЮЛ ДЛЯ ТУЛТИПОВ
-// ============================================================
-const directorIndex = new Map();
-const founderIndex  = new Map();
-const orgByOgrn     = new Map();
-
-// 1. Главная база (глубокая)
-for (const e of Object.values(EGRUL_ENTITIES)) {
-  orgByOgrn.set(e.ogrn, {...e, founders: e.founders || []});
-  if (e.director_inn && e.director) {
-    if (!directorIndex.has(e.director_inn))
-      directorIndex.set(e.director_inn, {fio: e.director, entities: []});
-    directorIndex.get(e.director_inn).entities.push(e);
-  }
-  for (const f of (e.founders || [])) {
-    if (!f.inn) continue;
-    if (!founderIndex.has(f.inn))
-      founderIndex.set(f.inn, {fio: f.name, entities: []});
-    founderIndex.get(f.inn).entities.push(e);
-  }
-}
-
-// 2. "Потерянные" УК (короткая база) — только для тултипа ЮЛ
-for (const [ogrn, e] of Object.entries(EGRUL_LOST)) {
-  if (!orgByOgrn.has(ogrn)) {
-    orgByOgrn.set(ogrn, {
-      ogrn: ogrn,
-      name: e.name,
-      director: e.director,
-      director_inn: "",
-      address: "",
-      founders: [],
-    });
-  }
-}
-
-const personsByOrg = new Map();
-for (const e of Object.values(EGRUL_ENTITIES)) {
-  const m = new Map();
-  if (e.director_inn && e.director) m.set(e.director_inn, {fio: e.director, role: "директор"});
-  for (const f of (e.founders || [])) {
-    if (!f.inn) continue;
-    if (m.has(f.inn)) {
-      const cur = m.get(f.inn);
-      if (cur.role === "директор") cur.role = "директор, учредитель";
-    } else {
-      m.set(f.inn, {fio: f.name, role: "учредитель"});
-    }
-  }
-  personsByOrg.set(e.ogrn, m);
-}
-
-// ============================================================
-// АДРЕСА
-// ============================================================
-function normAddress(s) {
-  return String(s || "")
-    .toUpperCase()
-    .replace(/Ё/g, "Е")
-    .replace(/Г\.О\.\s*ГОРОД ОМСК,?\s*Г\.\s*ОМСК,?\s*/g, "")
-    .replace(/ОМСКАЯ ОБЛАСТЬ,?\s*/g, "")
-    .replace(/СТРАНИЦА\s+\d+\s+ИЗ.*$/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/,$/, "");
-}
-function addrType(norm) {
-  return /(^|[\s,])(КВ\.|КВАРТИРА|КОМ\.)/.test(norm) ? "home" : "office";
-}
-
-const addressIndex = new Map();
-for (const e of Object.values(EGRUL_ENTITIES)) {
-  if (!e.address) continue;
-  const norm = normAddress(e.address);
-  if (!norm) continue;
-  if (!addressIndex.has(norm)) {
-    addressIndex.set(norm, {display: e.address, type: addrType(norm), entities: []});
-  }
-  addressIndex.get(norm).entities.push(e);
-}
-
-// ============================================================
-// СВЯЗИ ЮЛ ↔ ЮЛ ЧЕРЕЗ ПЕРСОН (1 шаг)
-// ============================================================
-function orgNeighborsByPerson(org) {
-  const result = new Map();
-  const persons = personsByOrg.get(org.ogrn) || new Map();
-  for (const [inn, p] of persons) {
-    const dir = directorIndex.get(inn);
-    if (dir) {
-      for (const e of dir.entities) {
-        if (e.ogrn === org.ogrn) continue;
-        addNeighbor(result, e, p.fio, inn, "директор");
-      }
-    }
-    const fnd = founderIndex.get(inn);
-    if (fnd) {
-      for (const e of fnd.entities) {
-        if (e.ogrn === org.ogrn) continue;
-        addNeighbor(result, e, p.fio, inn, "учредитель");
-      }
-    }
-  }
-  return result;
-}
-function addNeighbor(map, org, fio, inn, role) {
-  if (!map.has(org.ogrn)) map.set(org.ogrn, {org, persons: []});
-  const item = map.get(org.ogrn);
-  const exists = item.persons.some(p => p.inn === inn && p.role === role);
-  if (!exists) item.persons.push({fio, inn, role});
-}
-
-// ============================================================
-// ПОСТРОЕНИЕ СТРОК ТУЛТИПА
-// ============================================================
-function roleLabelFor(e, inn) {
-  const isDir = e.director_inn === inn;
-  const isF  = (e.founders || []).some(f => f.inn === inn);
-  if (isDir && isF) return "директор, учредитель";
-  if (isDir) return "директор";
-  return "учредитель";
-}
-
-function buildFioTooltip(fio, inn) {
-  const lines = [{type:"title", text:`Предположительный граф аффилированности`}];
-  const map = new Map();
-  const dir = directorIndex.get(inn);
-  const found = founderIndex.get(inn);
-  if (dir) dir.entities.forEach(e => map.set(e.ogrn, e));
-  if (found) found.entities.forEach(e => map.set(e.ogrn, e));
-  const list = [...map.values()].sort((a, b) => a.name.localeCompare(b.name, "ru"));
-  list.forEach((e, i) => {
-    const last = i === list.length - 1;
-    const tree = last ? "└──" : "├──";
-    lines.push({type:"line", text:`${tree} ${e.name} (${e.ogrn}) — ${roleLabelFor(e, inn)}`});
-  });
-  return lines;
-}
-
-function buildOrgTooltip(org) {
-  const lines = [{type:"title", text:`Предположительный граф аффилированности`}];
-  const nbr = orgNeighborsByPerson(org);
-  const nbrArr = [...nbr.values()].sort((a, b) => a.org.name.localeCompare(b.org.name, "ru"));
-  if (nbrArr.length > 0) {
-    lines.push({type:"sect", text:`Связи через персон:`});
-    nbrArr.forEach((item, idx) => {
-      const last = idx === nbrArr.length - 1;
-      const tree = last ? "└──" : "├──";
-      lines.push({type:"line", text:`${tree} ${item.org.name} (${item.org.ogrn})`});
-      item.persons.forEach(p => {
-        lines.push({type:"who", text:`      через ${p.fio} (${p.inn}) — ${p.role}`});
-      });
-    });
-  }
-  const norm = normAddress(org.address);
-  const bucket = addressIndex.get(norm);
-  if (bucket) {
-    const addrNeighbors = bucket.entities.filter(e => e.ogrn !== org.ogrn);
-    if (addrNeighbors.length > 0) {
-      lines.push({type:"sect", text:`По «резиновому» офису:`});
-      const typeLabel = bucket.type === "home" ? "жилой адрес" : "офис";
-      lines.push({type:"line", text:`  ${bucket.display} (${typeLabel})`});
-      const sorted = [...addrNeighbors].sort((a, b) => a.name.localeCompare(b.name, "ru"));
-      sorted.forEach((e, i) => {
-        const last = i === sorted.length - 1;
-        const tree = last ? "  └──" : "  ├──";
-        lines.push({type:"line", text:`${tree} ${e.name} (${e.ogrn})`});
-      });
-    }
-  }
-  if (lines.length === 1) return null;
-  return lines;
-}
-
-function renderTipHtml(lines) {
-  const out = [];
-  for (const ln of lines) {
-    if (ln.type === "title") out.push(`<div class="title">${esc(ln.text)}</div>`);
-    else if (ln.type === "sect") out.push(`<div class="sect">${esc(ln.text)}</div>`);
-    else if (ln.type === "who") out.push(`<div class="who">${esc(ln.text)}</div>`);
-    else out.push(`<div class="line">${esc(ln.text)}</div>`);
-  }
-  return out.join("");
-}
-
-const tipEl = document.getElementById("tip");
-
-function positionTip(x, y) {
-  const rect = tipEl.getBoundingClientRect();
-  const pad = 12;
-  let left = x + 16, top = y + 16;
-  if (left + rect.width + pad > window.innerWidth) left = x - rect.width - 16;
-  if (top + rect.height + pad > window.innerHeight) top = y - rect.height - 16;
-  if (left < pad) left = pad;
-  if (top < pad) top = pad;
-  tipEl.style.left = left + "px";
-  tipEl.style.top = top + "px";
-}
-
-function showTipFor(el, x, y) {
-  let lines;
-  if (el.classList.contains("org-director")) {
-    const inn = el.dataset.inn || "", fio = el.dataset.fio || "";
-    if (!inn || !fio) return;
-    lines = buildFioTooltip(fio, inn);
-  } else if (el.classList.contains("org-name")) {
-    const ogrn = el.dataset.ogrn || "";
-    const org = orgByOgrn.get(ogrn);
-    if (!org) return;
-    lines = buildOrgTooltip(org);
-    if (!lines) return;
-  } else return;
-  tipEl.innerHTML = renderTipHtml(lines);
-  tipEl.classList.add("open");
-  positionTip(x, y);
-}
-
-function hideTip() { tipEl.classList.remove("open"); }
-
-document.addEventListener("mouseover", (ev) => {
-  const el = ev.target.closest(".org-name, .org-director");
-  if (el) showTipFor(el, ev.clientX, ev.clientY);
-});
-document.addEventListener("mousemove", (ev) => {
-  const el = ev.target.closest(".org-name, .org-director");
-  if (!el) { hideTip(); return; }
-  if (tipEl.classList.contains("open")) positionTip(ev.clientX, ev.clientY);
-});
-document.addEventListener("mouseout", (ev) => {
-  const el = ev.target.closest(".org-name, .org-director");
-  if (!el) return;
-  const to = ev.relatedTarget;
-  if (!to || !to.closest || !to.closest(".org-name, .org-director")) hideTip();
-});
-
-// ============================================================
-// ДАЛЬШЕ — СУЩЕСТВУЮЩАЯ ЛОГИКА ОТЧЁТА
-// ============================================================
-let sortKey = "trust", sortAsc = true, slideshowTimer = null;
+let expandedOrgs = new Set();
+let sortKey = "trust";
+let sortAsc = true;
+let slideshowTimer = null;
 const FRAME_MS = 2000;
-let slideshowState = { imgs: [], srcs: [], cur: 0, paused: false, activeCount: 0 };
-const expandedOrgs = new Set();
 
 function esc(s) {
-  return String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+  return String(s == null ? "" : s).replace(/[&<>"']/g, c => ({
+    "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"
+  }[c]));
 }
-function fmtArea(v) {
-  if (v === null || v === undefined) return "0";
-  var s = v.toFixed(2);
-  if (s.indexOf(".") >= 0) s = s.replace(/0+$/, "").replace(/\.$/, "");
-  return s;
+function fmtNum(v) {
+  if (v == null) return "";
+  const n = Number(v);
+  if (!isFinite(n)) return "";
+  return n.toLocaleString("ru-RU", { maximumFractionDigits: 2 });
 }
-function fmtOdiDelta(v) {
-  if (v === null || v === undefined || Math.abs(v) < 0.01) return "";
-  var s = Math.abs(v).toFixed(2);
-  if (s.indexOf(".") >= 0) s = s.replace(/0+$/, "").replace(/\.$/, "");
-  return "\u2212" + s + " м<sup>2</sup>";
+function fmtNegDelta(v) {
+  if (v == null) return "";
+  const n = Number(v);
+  if (!(n < 0)) return "";
+  return "\u2212" + Math.abs(n).toFixed(2).replace(/\.?0+$/, "") + " м<sup>2</sup>";
 }
-function trustColor(trust) {
-  if (trust >= 99.5) return "hsl(200, 70%, 50%)";
-  if (trust >= 81)   return "hsl(140, 60%, 40%)";
-  if (trust >= 61)   return "hsl(80, 65%, 40%)";
-  if (trust >= 41)   return "hsl(50, 80%, 40%)";
-  if (trust >= 21)   return "hsl(30, 85%, 45%)";
-  if (trust >= 0.5)  return "hsl(10, 80%, 45%)";
+function trustColor(t) {
+  if (t >= 99.5) return "hsl(200, 70%, 50%)";
+  if (t >= 81)   return "hsl(140, 60%, 40%)";
+  if (t >= 61)   return "hsl(80, 65%, 40%)";
+  if (t >= 41)   return "hsl(50, 80%, 40%)";
+  if (t >= 21)   return "hsl(30, 85%, 45%)";
+  if (t >= 0.5)  return "hsl(10, 80%, 45%)";
   return "hsl(350, 70%, 35%)";
 }
-function hashCode(str) {
+function hashCode(s) {
   let h = 0;
-  for (let i = 0; i < str.length; i++) h = (h * 31 + str.charCodeAt(i)) | 0;
+  for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
   return Math.abs(h);
 }
-function pastelColorForDate(dateStr) { return "hsl(" + (hashCode(dateStr) % 360) + ", 50%, 92%)"; }
-
-function showHint(e) {
-  const el = document.getElementById("hint-tooltip");
-  el.textContent = MASS_DATE_HINT;
-  el.style.display = "block";
-  let x = e.clientX + 15, y = e.clientY + 15;
-  const rect = el.getBoundingClientRect();
-  if (x + rect.width > window.innerWidth) x = e.clientX - rect.width - 15;
-  if (y + rect.height > window.innerHeight) y = e.clientY - rect.height - 15;
-  el.style.left = x + "px";
-  el.style.top = y + "px";
+function pastelColorForDate(d) {
+  const h = hashCode(d) % 360;
+  return "hsl(" + h + ", 50%, 92%)";
 }
-function hideHint() { document.getElementById("hint-tooltip").style.display = "none"; }
+function massDateKey(s) {
+  return (s && s.mass_date) || "";
+}
+function markersSum(s) {
+  if (!s) return 0;
+  return (s.n_count || 0) + (s.j_count || 0) + (s.e_count || 0) + (s.o_count || 0);
+}
 
 function render() {
   const tbody = document.getElementById("tbody");
@@ -922,180 +1082,136 @@ function render() {
 
   const byOrg = {};
   DATA.forEach(r => {
-    if (!byOrg[r.org]) byOrg[r.org] = [];
-    byOrg[r.org].push(r);
+    const key = r.org_norm;
+    if (!byOrg[key]) byOrg[key] = [];
+    byOrg[key].push(r);
   });
 
   const orgs = Object.keys(byOrg);
-
   orgs.sort((a, b) => {
-    const ta = ORG_SUMMARY_BACKEND[a] ? ORG_SUMMARY_BACKEND[a].trust : 0;
-    const tb = ORG_SUMMARY_BACKEND[b] ? ORG_SUMMARY_BACKEND[b].trust : 0;
-    if (ta !== tb) return sortAsc ? ta - tb : tb - ta;
-    const cmp = a.toLowerCase().localeCompare(b.toLowerCase());
-    return sortAsc ? cmp : -cmp;
+    const sa = ORG_SUMMARY[a] || {};
+    const sb = ORG_SUMMARY[b] || {};
+    let va, vb;
+    if (sortKey === "trust") {
+      va = sa.trust || 0; vb = sb.trust || 0;
+    } else if (sortKey === "addr") {
+      va = sa.addr_count || 0; vb = sb.addr_count || 0;
+    } else if (sortKey === "mass") {
+      va = massDateKey(sa); vb = massDateKey(sb);
+    } else if (sortKey === "markers") {
+      va = markersSum(sa); vb = markersSum(sb);
+    } else {
+      va = 0; vb = 0;
+    }
+    if (va < vb) return sortAsc ? -1 : 1;
+    if (va > vb) return sortAsc ? 1 : -1;
+    return a.localeCompare(b);
   });
 
-  let globalNegSum = 0;
+  orgs.forEach(orgKey => {
+    const s = ORG_SUMMARY[orgKey] || {};
+    const color = trustColor(s.trust || 0);
+    const ogrn = (s.ogrns && s.ogrns[0]) || "";
+    const form = (s.org_ogrn_egrul && ORG_LIST[s.org_ogrn_egrul] && ORG_LIST[s.org_ogrn_egrul].form) || "";
+    const displayName = s.org || orgKey;
 
-  orgs.forEach(org => {
-    const s = ORG_SUMMARY_BACKEND[org] || {
-      trust: 0, addr_count: 0, n_count: 0, j_count: 0,
-      e_count: 0, o_count: 0, mass_date: "", mass_count: 0,
-      mass_dates: {}, holiday_count: 0, ogrns: [], director: ""
-    };
-    const color = trustColor(s.trust);
+    let nameHtml = esc(displayName);
+    if (ogrn) {
+      const tipKey = s.org_ogrn_egrul || ogrn;
+      const hasTip = TIPS_BY_ORG && TIPS_BY_ORG[tipKey];
+      const cls = hasTip ? "org-tip" : "";
+      nameHtml = `<span class="${cls}" data-org="${esc(tipKey)}">${esc(displayName)}</span>`;
+    }
+    const orgCell =
+      `<td class="org-cell">` +
+        `<span class="org-name">${nameHtml}</span>` +
+        (ogrn ? `<span class="org-ogrn">${esc(form ? form + " " : "")}${esc(ogrn)}</span>` : "") +
+        `<span class="org-score" style="color:${color}">${(s.trust || 0).toFixed(1)}%</span>` +
+      `</td>`;
+
+    let addrCell;
+    if ((s.neg_count || 0) > 0) {
+      const sumTxt = fmtNegDelta(s.neg_sum);
+      addrCell =
+        `<td class="addr-cell">` +
+          `<span class="addr-text">${s.addr_count || 0}</span>` +
+          `<span class="addr-delta">${sumTxt}</span>` +
+        `</td>`;
+    } else {
+      addrCell = `<td>${s.addr_count || 0}</td>`;
+    }
+
+    let dateCell = `<td></td>`;
+    if (s.mass_date) {
+      const bg = s.mass_joke ? "#FFE0E0" : pastelColorForDate(s.mass_date);
+      dateCell =
+        `<td class="mass-date" style="background:${bg}">` +
+          `${esc(s.mass_date)} <b>(${s.mass_count}×)</b>` +
+          `<span class="mass-hint">проверить кворумы и пролонгацию</span>` +
+        `</td>`;
+    }
+
+    let counters = [];
+    if (s.n_count) counters.push(`<span class="n-counter">Н/Д: ${s.n_count}</span>`);
+    if (s.j_count) counters.push(`<span class="j-counter">Н/В: ${s.j_count}</span>`);
+    if (s.e_count) counters.push(`<span class="e-counter">Н/Э: ${s.e_count}</span>`);
+    if (s.o_count) counters.push(`<span class="o-counter">Н/О: ${s.o_count}</span>`);
+    const markersCell = `<td>${counters.join("")}</td>`;
+
+    let anomalies = [];
+    if (s.ghost_uk) anomalies.push("GHOST_UK");
+    if (s.low_capital) anomalies.push("LOW_CAPITAL");
+    if (s.mass_joke) anomalies.push("MASS_JOKE_DATE");
+    const anomaliesCell = `<td>${anomalies.join(", ")}</td>`;
+
+    const viewCell = `<td></td>`;
 
     const tr = document.createElement("tr");
     tr.className = "org-row";
-
-    let dateCellHtml = "";
-    if (s.mass_date) {
-      const bg = pastelColorForDate(s.mass_date);
-      dateCellHtml = "<td class='mass-date' style='background:" + bg + "'>" +
-        "<span class='mass-date-text'>" + esc(s.mass_date) + " <b>(" + s.mass_count + "×)</b></span>" +
-        "</td>";
-    } else dateCellHtml = "<td></td>";
-
-    let counters = [];
-    if (s.n_count > 0) counters.push("<span class='n-counter'>Н/Д: " + s.n_count + "</span>");
-    if (s.j_count > 0) counters.push("<span class='j-counter'>Н/В: " + s.j_count + "</span>");
-    if (s.e_count > 0) counters.push("<span class='e-counter'>Н/Э: " + s.e_count + "</span>");
-    if (s.o_count > 0) counters.push("<span class='o-counter'>Н/О: " + s.o_count + "</span>");
-    const markerCellHtml = "<td>" + counters.join("") + "</td>";
-
-    let addrCellHtml = "<td>" + s.addr_count + "</td>";
-    
-    if (s.odi_neg_sum < -0.01) {
-        globalNegSum += s.odi_neg_sum;
-        let deltaHtml = "<span class='area-result'>" + fmtOdiDelta(s.odi_neg_sum) + "</span>";
-        addrCellHtml = "<td class='addr-cell'><span class='addr-text'>" + s.addr_count + "</span><span class='addr-delta'>" + deltaHtml + "</span></td>";
-    }
-
-    let orgOgrn = (s.ogrns && s.ogrns.length > 0) ? s.ogrns[0] : "";
-    let egrul = EGRUL_ENTITIES[orgOgrn] || null;
-    let dirFio = egrul ? (egrul.director || "").toUpperCase() : "";
-    let dirInn = egrul ? (egrul.director_inn || "") : "";
-
-    let orgNameHtml = "<span class='org-name'" +
-        (orgOgrn ? " data-ogrn='" + esc(orgOgrn) + "'" : "") +
-        ">" + esc(org) + "</span>";
-    let ogrnHtml = "";
-    if (orgOgrn) {
-        ogrnHtml = "<span class='org-ogrn'>ОГРН: " + esc(orgOgrn) + "</span>";
-    }
-    let dirHtml = "";
-    if (dirFio) {
-        if (dirInn) {
-            dirHtml = "<span class='org-director' data-inn='" + esc(dirInn) + "' data-fio='" + esc(dirFio) + "'>" + esc(dirFio) + "</span>";
-        } else {
-            dirHtml = "<span class='org-director'>" + esc(dirFio) + "</span>";
-        }
-    }
-
     tr.innerHTML =
-      "<td class='toggle-cell'>+</td>" +
-      "<td class='org-cell'>" +
-        orgNameHtml +
-        ogrnHtml +
-        dirHtml +
-        "<span class='org-score' style='color:" + color + "'>" + s.trust.toFixed(0) + "%</span>" +
-      "</td>" +
-      addrCellHtml + dateCellHtml + markerCellHtml + "<td></td>";
-
+      `<td class="toggle-cell">${expandedOrgs.has(orgKey) ? "−" : "+"}</td>` +
+      orgCell + addrCell + dateCell + markersCell + anomaliesCell + viewCell;
     tbody.appendChild(tr);
 
-    if (s.mass_date) {
-      const dateSpan = tr.querySelector(".mass-date-text");
-      if (dateSpan) {
-        dateSpan.addEventListener("mouseenter", showHint);
-        dateSpan.addEventListener("mousemove", showHint);
-        dateSpan.addEventListener("mouseleave", hideHint);
-      }
-    }
+    const houses = byOrg[orgKey].slice().sort((a, b) => (a.addr || "").localeCompare(b.addr || ""));
+    houses.forEach(r => {
+      const markerCls = r.marker === "Ж" ? "marker-zh"
+                      : r.marker === "Н" ? "marker-n"
+                      : r.marker === "Д" ? "marker-d"
+                      : "marker-other";
+      const mass = s.mass_date && r.date === s.mass_date;
+      const dateCls = [mass ? "mass-date" : "", r.is_holiday ? "holiday-date" : ""].filter(Boolean).join(" ");
+      const dateStyle = mass ? ` style="background:${pastelColorForDate(r.date)}"` : "";
 
-    const isOpen = expandedOrgs.has(org);
-    const houseRows = [];
-
-    const houseList = byOrg[org].slice();
-    houseList.sort((a, b) => {
-      let va, vb;
-      if (sortKey === "trust") { va = (a.date || "").toLowerCase(); vb = (b.date || "").toLowerCase(); }
-      else if (sortKey === "marker") {
-        va = (a.marker || "").toLowerCase(); vb = (b.marker || "").toLowerCase();
-        if (va === vb) { va = (a.date || "").toLowerCase(); vb = (b.date || "").toLowerCase(); }
+      let addrHtml;
+      if (r.delta_value != null && r.delta_value < 0) {
+        addrHtml =
+          `<td class="addr-cell house-addr">` +
+            `<span class="addr-text">${esc(r.addr)}</span>` +
+            `<span class="addr-delta">${fmtNegDelta(r.delta_value)}</span>` +
+          `</td>`;
       } else {
-        va = (a[sortKey] ?? "").toString().toLowerCase(); vb = (b[sortKey] ?? "").toString().toLowerCase();
-      }
-      if (va < vb) return sortAsc ? -1 : 1;
-      if (va > vb) return sortAsc ? 1 : -1;
-      return 0;
-    });
-
-    houseList.forEach(r => {
-      const markerCls = r.marker === "Ж" ? "marker-zh" : r.marker === "Н" ? "marker-n" : "marker-other";
-      const mass = !!(s.mass_dates && s.mass_dates[r.date]);
-
-      const dateClasses = [];
-      if (mass) dateClasses.push("mass-date");
-      if (r.is_holiday) dateClasses.push("holiday-date");
-      const dateClass = dateClasses.length ? " class='" + dateClasses.join(" ") + "'" : "";
-      const dateStyle = mass ? " style='background:" + pastelColorForDate(r.date) + "'" : "";
-
-      let addrCell;
-      const odi = r.odi_delta;
-      
-      let addrHtml = esc(r.addr);
-      if (r.house_url) {
-          addrHtml = "<a href='" + esc(r.house_url) + "' target='_blank' class='addr-link'>" + esc(r.addr) + "</a>";
+        addrHtml = `<td class="house-addr">${esc(r.addr)}</td>`;
       }
 
-      if (odi !== null && odi !== undefined && odi < -0.01) {
-        const formula = 
-            "<span class='area-total'>" + fmtArea(r.total_area) + "</span> - " +
-            "<span class='area-living'>" + fmtArea(r.living_area) + "</span> - " +
-            "<span class='area-nonliving'>" + fmtArea(r.non_living_area) + "</span> = " +
-            "<span class='area-result'>" + fmtOdiDelta(odi) + ". Это S<sub>оди</sub>?</span>";
-        addrCell = "<td class='addr-cell house-addr'><span class='addr-text'>" + addrHtml + "</span><span class='addr-delta'>" + formula + "</span></td>";
-      } else {
-        addrCell = "<td class='house-addr'>" + addrHtml + "</td>";
-      }
+      let anom = [];
+      if (r.delta_value != null && r.delta_value < 0) anom.push("Δ<0");
+      const anomCell = `<td>${anom.join(", ")}</td>`;
 
-      const viewHtml = r.has_real_screens ? "<span class='btn-view'>Смотреть</span>" : "";
-      
-      let mismatchHtml = "";
-      if (r.is_mismatch && r.found_ogrn) {
-          let lostInfo = EGRUL_LOST[r.found_ogrn];
-          let orgName = lostInfo ? lostInfo.name : "";
-          let orgDir  = lostInfo ? (lostInfo.director || "").toUpperCase() : "";
-          let termDate = lostInfo && lostInfo.termination_date ? " (Прекращена: " + lostInfo.termination_date + ")" : "";
-          let lostDirInn = lostInfo ? (lostInfo.director_inn || "") : ""; 
-          
-          let lines = [];
-          if (orgName) lines.push("<span class='org-name' data-ogrn='" + esc(r.found_ogrn) + "'>" + esc(orgName) + "</span>");
-          lines.push("ОГРН: " + esc(r.found_ogrn));
-          if (orgDir) {
-              if (lostDirInn) {
-                  lines.push("<span class='org-director' data-inn='" + esc(lostDirInn) + "' data-fio='" + esc(orgDir) + "'>" + esc(orgDir) + "</span>");
-              } else {
-                  lines.push("<span class='org-director'>" + esc(orgDir) + "</span>");
-              }
-          }
-          if (termDate) lines.push(esc(termDate));
-          
-          mismatchHtml = "<div style='color:#000; font-size:7pt; margin-left:10px; display:inline-block; vertical-align:top;'>" + lines.join("<br>") + "</div>";
-      }
+      const viewHtml = r.has_real_screens
+        ? `<span class="btn-view">Смотреть</span>`
+        : "";
 
       const htr = document.createElement("tr");
-      htr.className = "house-row" + (isOpen ? " visible" : "");
+      htr.className = "house-row" + (expandedOrgs.has(orgKey) ? " visible" : "");
       htr.innerHTML =
-        "<td></td>" +
-        "<td></td>" +
-        addrCell +
-        "<td" + dateClass + dateStyle + ">" + esc(r.date) + "</td>" +
-        "<td class='" + markerCls + "'>" + esc(r.marker_long) + "</td>" +
-        "<td>" + viewHtml + mismatchHtml + "</td>";
-
+        `<td></td>` +
+        `<td></td>` +
+        addrHtml +
+        `<td class="${dateCls}"${dateStyle}>${esc(r.date)}</td>` +
+        `<td class="${markerCls}">${esc(r.marker_long)}</td>` +
+        anomCell +
+        `<td>${viewHtml}</td>`;
       const btn = htr.querySelector(".btn-view");
       if (btn) {
         btn.addEventListener("click", (ev) => {
@@ -1103,279 +1219,410 @@ function render() {
           openOverlay(r);
         });
       }
-
       tbody.appendChild(htr);
-      houseRows.push(htr);
     });
 
     const toggle = tr.querySelector(".toggle-cell");
-    toggle.textContent = isOpen ? "−" : "+";
     toggle.addEventListener("click", () => {
-      const nowOpen = !expandedOrgs.has(org);
-      if (nowOpen) expandedOrgs.add(org);
-      else expandedOrgs.delete(org);
-      houseRows.forEach(hr => {
-        if (nowOpen) hr.classList.add("visible");
-        else hr.classList.remove("visible");
-      });
-      toggle.textContent = nowOpen ? "−" : "+";
+      const nowOpen = !expandedOrgs.has(orgKey);
+      if (nowOpen) expandedOrgs.add(orgKey);
+      else expandedOrgs.delete(orgKey);
+      render();
     });
   });
 
-  // Итоговая строка
-  if (globalNegSum < -0.01) {
-    const totalAbs = Math.abs(globalNegSum);
-    const flats = Math.round(totalAbs / 50);
-    const costMin = Math.round(totalAbs * 10);
-    const costMax = Math.round(totalAbs * 18);
-
-    const trTotal = document.createElement("tr");
-    trTotal.className = "total-row";
-    trTotal.innerHTML = 
-      "<td></td>" +
-      "<td><b>ИТОГО по всем УК</b></td>" +
-      "<td class='addr-cell'><span class='addr-text'>Сумма отрицательных площадей:</span><span class='addr-delta area-result'>" + fmtOdiDelta(globalNegSum) + "</span></td>" +
-      "<td colspan='3' style='color:#666; font-size:12px; line-height: 1.4;'>" +
-        "Это площадь в среднем <b>" + flats + " квартир</b>. " +
-        "При тарифе от 10 до 18 рублей за кв.м такая площадь стоит " +
-        "от <b>" + costMin.toLocaleString('ru-RU') + "</b> до <b>" + costMax.toLocaleString('ru-RU') + "</b> рублей в месяц." +
-      "</td>";
-    tbody.appendChild(trTotal);
-  }
-
   document.getElementById("count").textContent = DATA.length;
+
+  document.querySelectorAll(".org-tip").forEach(el => {
+    el.addEventListener("mouseenter", (ev) => {
+      const ogrn = el.dataset.org;
+      const tipLines = TIPS_BY_ORG[ogrn];
+      if (tipLines) showTip(tipLines, ev.clientX, ev.clientY);
+    });
+    el.addEventListener("mousemove", (ev) => positionTip(ev.clientX, ev.clientY));
+    el.addEventListener("mouseleave", hideTip);
+  });
+
+  document.querySelectorAll("th[data-key]").forEach(th => {
+    const arrow = th.querySelector(".arrow");
+    if (arrow) arrow.textContent = (th.dataset.key === sortKey) ? (sortAsc ? "▲" : "▼") : "";
+  });
 }
 
 function openOverlay(record) {
   const ov = document.getElementById("overlay");
-  const imgs = [0,1,2,3,4].map(i => document.getElementById("ov_img" + i));
+  const imgs = [
+    document.getElementById("ov_img0"),
+    document.getElementById("ov_img1"),
+    document.getElementById("ov_img2"),
+    document.getElementById("ov_img3"),
+  ];
   if (slideshowTimer) { clearInterval(slideshowTimer); slideshowTimer = null; }
-  const srcs = (record.screens && record.screens.length) ? record.screens.slice() : [record.scr_a, record.scr_b, record.scr_c].filter(Boolean).concat(record.scr_pdf ? [record.scr_pdf] : []);
-  
-  imgs.forEach(im => { im.classList.remove("active"); im.removeAttribute("src"); im.style.display = "none"; });
-  srcs.forEach((src, i) => { if (i >= imgs.length) return; imgs[i].src = src; imgs[i].style.display = ""; });
+
+  const srcs = (record.screens || []).slice();
+  imgs.forEach(im => {
+    im.classList.remove("active");
+    im.removeAttribute("src");
+    im.style.display = "none";
+  });
+  srcs.forEach((src, i) => {
+    if (i >= imgs.length) return;
+    imgs[i].src = src;
+    imgs[i].style.display = "";
+  });
   imgs[0].classList.add("active");
-  
-  slideshowState.imgs = imgs; 
-  slideshowState.srcs = srcs; // Сохраняем пути для тултипа
-  slideshowState.cur = 0; 
-  slideshowState.paused = false; 
-  slideshowState.activeCount = Math.min(srcs.length, imgs.length);
-  
-  ov.classList.remove("paused");
-  
-  const cap = document.getElementById("ov_caption");
-  const fn = document.getElementById("ov_filename");
-  fn.textContent = srcs[0] || "";
-  
+
   ov.classList.add("open");
-  startSlideshowTimer();
-}
-function startSlideshowTimer() {
-  if (slideshowTimer) { clearInterval(slideshowTimer); slideshowTimer = null; }
-  const n = slideshowState.activeCount;
-  if (n <= 0) return;
+  ov.classList.remove("paused");
+  const state = { imgs, cur: 0, paused: false, n: Math.min(srcs.length, imgs.length) };
+
   slideshowTimer = setInterval(() => {
-    if (slideshowState.paused) return;
-    if (slideshowState.cur >= n - 1) { clearInterval(slideshowTimer); slideshowTimer = null; closeOverlay(); return; }
-    
-    slideshowState.imgs[slideshowState.cur].classList.remove("active");
-    slideshowState.cur += 1;
-    slideshowState.imgs[slideshowState.cur].classList.add("active");
-    
-    // Обновляем имя файла
-    const fn = document.getElementById("ov_filename");
-    if (slideshowState.srcs && slideshowState.srcs[slideshowState.cur]) {
-        fn.textContent = slideshowState.srcs[slideshowState.cur];
+    if (state.paused) return;
+    if (state.cur >= state.n - 1) {
+      clearInterval(slideshowTimer);
+      slideshowTimer = null;
+      closeOverlay();
+      return;
     }
+    state.imgs[state.cur].classList.remove("active");
+    state.cur += 1;
+    state.imgs[state.cur].classList.add("active");
   }, FRAME_MS);
 }
-function togglePause() {
-  const ov = document.getElementById("overlay");
-  slideshowState.paused = !slideshowState.paused;
-  if (slideshowState.paused) ov.classList.add("paused"); else ov.classList.remove("paused");
-}
+
 function closeOverlay() {
   const ov = document.getElementById("overlay");
-  ov.classList.remove("open"); ov.classList.remove("paused");
+  ov.classList.remove("open");
   if (slideshowTimer) { clearInterval(slideshowTimer); slideshowTimer = null; }
-  slideshowState.imgs.forEach(im => { im.classList.remove("active"); im.removeAttribute("src"); im.style.display = "none"; });
-  slideshowState.imgs = []; slideshowState.cur = 0; slideshowState.paused = false; slideshowState.activeCount = 0; slideshowState.srcs = [];
 }
 
 document.addEventListener("keydown", e => {
-  if (e.key === "Escape") { closeOverlay(); return; }
-  if (e.key === " " || e.code === "Space") {
-    const ov = document.getElementById("overlay");
-    if (ov.classList.contains("open")) { e.preventDefault(); togglePause(); }
-  }
+  if (e.key === "Escape") closeOverlay();
 });
-document.getElementById("overlay").addEventListener("click", e => {
-  const ov = document.getElementById("overlay");
-  if (!ov.classList.contains("open")) return;
-  if (e.target.classList.contains("close")) return;
-  if (e.target.tagName === "IMG") togglePause();
-  else if (e.target.id === "overlay" || e.target.classList.contains("frame") || e.target.classList.contains("caption") || e.target.classList.contains("paused-badge")) {
-    if (e.target.id === "overlay") closeOverlay(); else togglePause();
+
+function positionTip(x, y) {
+  const tipEl = document.getElementById("tip");
+  const rect = tipEl.getBoundingClientRect();
+  const pad = 12;
+  let left = x + 16;
+  let top  = y + 16;
+  if (left + rect.width + pad > window.innerWidth)  left = x - rect.width - 16;
+  if (top  + rect.height + pad > window.innerHeight) top  = y - rect.height - 16;
+  if (left < pad) left = pad;
+  if (top  < pad) top  = pad;
+  tipEl.style.left = left + "px";
+  tipEl.style.top  = top  + "px";
+}
+
+function showTip(lines, x, y) {
+  const tipEl = document.getElementById("tip");
+  const html = [];
+  for (const ln of lines) {
+    if (ln.type === "title") html.push(`<div class="title">${esc(ln.text)}</div>`);
+    else if (ln.type === "sect") html.push(`<div class="sect">${esc(ln.text)}</div>`);
+    else if (ln.type === "who") html.push(`<div class="who">${esc(ln.text)}</div>`);
+    else html.push(`<div class="line">${esc(ln.text)}</div>`);
   }
+  tipEl.innerHTML = html.join("");
+  tipEl.classList.add("open");
+  positionTip(x, y);
+}
+function hideTip() {
+  document.getElementById("tip").classList.remove("open");
+}
+
+document.getElementById("btn-expand-all").addEventListener("click", () => {
+  const allOrgs = Object.keys(ORG_SUMMARY);
+  const allOpen = allOrgs.every(o => expandedOrgs.has(o));
+  if (allOpen) expandedOrgs.clear();
+  else allOrgs.forEach(o => expandedOrgs.add(o));
+  document.getElementById("btn-expand-all").textContent = allOpen ? "Развернуть все" : "Свернуть все";
+  render();
 });
-document.getElementById("overlay").addEventListener("contextmenu", e => true);
 
 document.querySelectorAll("th[data-key]").forEach(th => {
   th.addEventListener("click", () => {
     const key = th.dataset.key;
     if (sortKey === key) sortAsc = !sortAsc;
     else { sortKey = key; sortAsc = true; }
-    document.querySelectorAll("th .arrow").forEach(a => a.textContent = "");
-    th.querySelector(".arrow").textContent = sortAsc ? "▲" : "▼";
     render();
   });
 });
-document.getElementById("mass_min") && (document.getElementById("mass_min").textContent = MASS_DATE_MIN);
-document.getElementById("btn-expand-all").addEventListener("click", () => {
-  const btn = document.getElementById("btn-expand-all");
-  const allOrgs = new Set(DATA.map(r => r.org));
-  const allExpanded = [...allOrgs].every(o => expandedOrgs.has(o));
-  if (allExpanded) { expandedOrgs.clear(); btn.textContent = "Развернуть все"; }
-  else { allOrgs.forEach(o => expandedOrgs.add(o)); btn.textContent = "Свернуть все"; }
-  render();
-});
+
 render();
 </script>
 </body>
 </html>
 """
 
-# ============================== ОЧИСТКА IMG ==============================
-def _collect_used_screens(records):
-    used = set()
-    for r in records:
-        for k in ("scr_a", "scr_b", "scr_c", "scr_pdf"):
-            v = r.get(k) or ""
-            if v: used.add(v)
-        for s in r.get("screens") or []:
-            if s: used.add(s)
-    if DOWNLOAD_ERRORS_SRC.exists():
-        try:
-            err_text = DOWNLOAD_ERRORS_SRC.read_text(encoding="utf-8", errors="replace")
-            for m in RE_SCR_IN_ERRLOG.finditer(err_text): used.add(m.group(1))
-        except Exception: pass
-    return used
 
-def trash_unused_imgs(records):
-    used = _collect_used_screens(records)
-    all_imgs = sorted(IMG_DIR.glob("*.png"), key=lambda p: p.name)
-    unused = [p for p in all_imgs if p.name not in used]
-    if not unused: return
-    try: TRASH_DIR.mkdir(parents=True, exist_ok=True)
-    except Exception: return
+# ============================================================
+# СБОРКА ТУЛТИПОВ
+# ============================================================
+def role_label_for(egrul: Egrul, ogrn: str, inn: str) -> str:
+    e = egrul.entities[ogrn]
+    is_dir = (e.get("director_inn") or "") == inn
+    is_f = any((f.get("inn") or "") == inn for f in (e.get("founders") or []))
+    if is_dir and is_f:
+        return "директор, учредитель"
+    if is_dir:
+        return "директор"
+    return "учредитель"
+
+
+def build_fio_tooltip(egrul: Egrul, fio: str, inn: str) -> list[dict]:
+    lines = [{"type": "title", "text": "Предположительный граф аффилированности"}]
+    orgs: set[str] = set()
+    orgs.update(egrul.directors_by_inn.get(inn, []))
+    orgs.update(egrul.founders_by_inn.get(inn, []))
+    sorted_orgs = sorted(orgs, key=lambda o: egrul.display_name(o))
+    for i, ogrn in enumerate(sorted_orgs):
+        last = i == len(sorted_orgs) - 1
+        tree = "└──" if last else "├──"
+        name = egrul.display_name(ogrn)
+        form = egrul.display_form(ogrn)
+        lines.append({"type": "line",
+                      "text": f"{tree} {form} \"{name}\" ({ogrn}) — {role_label_for(egrul, ogrn, inn)}"})
+    return lines
+
+
+def build_org_tooltip(egrul: Egrul, ogrn: str) -> list[dict] | None:
+    lines = [{"type": "title", "text": "Предположительный граф аффилированности"}]
+
+    nbr = egrul.neighbors_by_person(ogrn)
+    if nbr:
+        lines.append({"type": "sect", "text": "Связи через персон:"})
+        nbr_items = sorted(nbr.items(), key=lambda kv: egrul.display_name(kv[0]))
+        for i, (nb_ogrn, item) in enumerate(nbr_items):
+            last = i == len(nbr_items) - 1
+            tree = "└──" if last else "├──"
+            name = egrul.display_name(nb_ogrn)
+            form = egrul.display_form(nb_ogrn)
+            lines.append({"type": "line", "text": f"  {tree} {form} \"{name}\" ({nb_ogrn})"})
+            for p in item["persons"]:
+                lines.append({"type": "who",
+                              "text": f"        через {p['fio']} ({p['inn']}) — {p['role']}"})
+
+    addr = egrul.address_neighbors(ogrn)
+    if addr:
+        kind = "жилой адрес" if addr["kind"] == "home" else "офис"
+        lines.append({"type": "sect", "text": "По «резиновому» офису:"})
+        lines.append({"type": "line", "text": f"  {addr['display']} ({kind})"})
+        sorted_ogrns = sorted(addr["ogrns"], key=lambda o: egrul.display_name(o))
+        for i, nb_ogrn in enumerate(sorted_ogrns):
+            last = i == len(sorted_ogrns) - 1
+            tree = "└──" if last else "├──"
+            name = egrul.display_name(nb_ogrn)
+            form = egrul.display_form(nb_ogrn)
+            lines.append({"type": "line", "text": f"  {tree} {form} \"{name}\" ({nb_ogrn})"})
+
+    if len(lines) == 1:
+        return None
+    return lines
+
+
+def build_fio_list(egrul: Egrul, min_orgs: int = 2) -> list[dict]:
+    fio_map: dict[str, dict] = {}
+    for inn, ogrns in egrul.directors_by_inn.items():
+        fio = None
+        for o in ogrns:
+            e = egrul.entities[o]
+            if (e.get("director_inn") or "") == inn:
+                fio = norm_fio(e.get("director") or "")
+                break
+        if not fio:
+            continue
+        fio_map.setdefault(inn, {"fio": fio, "inn": inn, "ogrns": set()})
+        fio_map[inn]["ogrns"].update(ogrns)
+    for inn, ogrns in egrul.founders_by_inn.items():
+        fio = None
+        for o in ogrns:
+            e = egrul.entities[o]
+            for f in e.get("founders") or []:
+                if (f.get("inn") or "") == inn:
+                    fio = norm_fio(f.get("name") or "")
+                    break
+            if fio:
+                break
+        if not fio:
+            continue
+        fio_map.setdefault(inn, {"fio": fio, "inn": inn, "ogrns": set()})
+        fio_map[inn]["ogrns"].update(ogrns)
+    out = [
+        {"fio": v["fio"], "inn": v["inn"], "ogrns": sorted(v["ogrns"])}
+        for v in fio_map.values()
+        if len(v["ogrns"]) >= min_orgs
+    ]
+    out.sort(key=lambda x: x["fio"])
+    return out
+
+
+# ============================================================
+# ОЧИСТКА PNG
+# ============================================================
+def trash_unused_png(records: list[dict], dry_run: bool = False) -> None:
+    used: set[str] = set()
+    for r in records:
+        for s in r.get("screens") or []:
+            if s and s.endswith(".png"):
+                used.add(s)
+
+    all_png = sorted(IMG_DIR.glob("*.png"), key=lambda p: p.name)
+    unused = [p for p in all_png if p.name not in used]
+
+    print(f"[+] использовано скринов: {len(used)}")
+    print(f"[+] всего .png в IMG_DIR: {len(all_png)}")
+    print(f"[+] неиспользованных: {len(unused)}")
+
+    if dry_run or not unused:
+        return
+    try:
+        TRASH_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[!] не удалось создать {TRASH_DIR}: {e}")
+        return
+    moved = 0
     for p in unused:
         try:
             target = TRASH_DIR / p.name
-            if not target.exists(): shutil.move(str(p), str(target))
-        except Exception: pass
+            if target.exists():
+                continue
+            shutil.move(str(p), str(target))
+            moved += 1
+        except Exception as e:
+            print(f"    [!] {p.name}: {e}")
+    print(f"[+] перемещено в {TRASH_DIR}: {moved}")
 
-# ============================== MAIN ==============================
+
+# ============================================================
+# MAIN
+# ============================================================
 def main():
-    if not LOG_DIR.exists() or not IMG_DIR.exists():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--no-trash", action="store_true", help="не чистить PNG")
+    ap.add_argument("--only-ogrn", default="", help="обработать только один ОГРН")
+    ap.add_argument("--no-egrul", action="store_true", help="не загружать ЕГРЮЛ")
+    args = ap.parse_args()
+
+    if not LOG_DIR.exists():
+        print(f"[!] нет папки {LOG_DIR}")
         return
 
-    egrul_directors = load_egrul_directors(EGRUL_XML)
-    print(f"[+] ЕГРЮЛ: {EGRUL_XML} -> {len(egrul_directors)} записей")
-
-    egrul_full_all = load_egrul_short_data(EGRUL_SHORT_XML)
-    egrul_lost = load_egrul_short_data(EGRUL_LOST_SHORT_XML)
-    
-    avar_set = load_avar(AVAR_TXT)
-    print(f"[+] avar.txt -> {len(avar_set)} аварийных адресов")
-
-    records = parse_contracts_logs()
-    if not records: return
-
-    before = len(records)
-    records = [r for r in records if r["addr"].strip() not in avar_set]
-    print(f"[+] записей: {before}, после фильтра аварийных: {len(records)}")
-    if not records: return
-
-    used_ogrns = set()
-    for r in records:
-        o = r.get("ogrn") or ""
-        if o: used_ogrns.add(o)
-    
-    egrul_for_html = {o: egrul_full_all[o] for o in used_ogrns if o in egrul_full_all}
-
-    for r in records:
-        if r.get("scr_a"):
-            png_path = IMG_DIR / r["scr_a"]
-            chunks = read_png_chunks(png_path)
-            desc = chunks.get("Description", "")
-            total, living, non_living = extract_areas_from_desc(desc)
-            r["total_area"] = total
-            r["living_area"] = living
-            r["non_living_area"] = non_living
-            r["odi_delta"] = total - living - non_living
-            
-            url = chunks.get("Source", "")
-            if url: r["house_url"] = url.strip()
-
-        if r.get("scr_pdf"):
-            pdf_path = IMG_DIR / r["scr_pdf"]
-            chunks = read_png_chunks(pdf_path)
-            desc = chunks.get("Description", "")
-            if desc:
-                found_org, found_dir = extract_org_and_director_from_ocr(desc)
-                if found_org:
-                    r["ocr_name"] = found_org
-                    if len(found_org) == 13 and found_org.isdigit():
-                        r["found_ogrn"] = found_org
-                    
-                    if r["found_ogrn"] and r["found_ogrn"] not in BLACKLIST_OGRN:
-                        current_uk_ogrn = r.get("ogrn", "")
-                        if r["found_ogrn"] != current_uk_ogrn:
-                            r["is_mismatch"] = True
-                    else:
-                        r["found_ogrn"] = ""
-
-    org_stats = parse_gisjkh_logs()
-    mass_per_org = compute_mass_date_per_org(records)
-    org_summary = compute_org_summary(records, org_stats, mass_per_org, egrul_directors)
-
-    # === ИСПРАВЛЕНИЕ: Сверяем ОГРН из скана с ОГРН организации, а не с именем файла ===
-    for r in records:
-        if r.get("found_ogrn"):
-            cur_ogrn = ""
-            if r["org"] in org_summary and org_summary[r["org"]]["ogrns"]:
-                cur_ogrn = org_summary[r["org"]]["ogrns"][0]
-            if r["found_ogrn"] != cur_ogrn:
-                r["is_mismatch"] = True
-            else:
-                r["is_mismatch"] = False
-
-    if DOWNLOAD_ERRORS_SRC.exists():
+    print("[i] загрузка ЕГРЮЛ...")
+    egrul = None
+    if not args.no_egrul:
         try:
-            shutil.copyfile(DOWNLOAD_ERRORS_SRC, DOWNLOAD_ERRORS_DST)
-            print(f"[+] download_errors.log → {DOWNLOAD_ERRORS_DST}")
-        except Exception as e: print(f"[!] ошибка: {e}")
+            egrul = load_egrul(filter_by_act=True)
+            print(f"[+] ЕГРЮЛ: {len(egrul.entities)} записей")
+        except Exception as e:
+            print(f"[!] ЕГРЮЛ не загружен: {e}")
+            traceback.print_exc()
+
+    print("[i] парсинг contracts*.log...")
+    records = parse_contracts_logs(egrul)
+    if args.only_ogrn:
+        records = [r for r in records if r["ogrn"] == args.only_ogrn]
+    print(f"[+] записей contracts: {len(records)}")
+
+    print("[i] парсинг gisjkh-ufo*.log...")
+    gisjkh_stats = parse_gisjkh_logs()
+    if args.only_ogrn:
+        gisjkh_stats = {k: v for k, v in gisjkh_stats.items() if k == args.only_ogrn}
+    print(f"[+] ОГРН в статистике gisjkh: {len(gisjkh_stats)}")
+
+    print("[i] массовые даты...")
+    mass_dates = compute_mass_dates(records)
+    print(f"[+] УК с массовой датой: {len(mass_dates)}")
+
+    print("[i] сводка по УК...")
+    org_summary = compute_org_summary(records, egrul, gisjkh_stats, mass_dates)
+    print(f"[+] УК в сводке: {len(org_summary)}")
+
+    tech_by_marker: dict[str, int] = defaultdict(int)
+    fallback_ok = 0
+    tech_houses = 0
+    for ogrn, gs in gisjkh_stats.items():
+        t = sum(gs["tech"].values())
+        if t:
+            tech_houses += 1
+        for k, v in gs["tech"].items():
+            tech_by_marker[k] += v
+        fallback_ok += gs.get("fallback_ok", 0)
+
+    total_houses = len(records)
+    tech_pct = (tech_houses / total_houses * 100) if total_houses else 0
+    tech_state = {
+        "total_ogrns": len(gisjkh_stats),
+        "total_houses": total_houses,
+        "tech_houses": tech_houses,
+        "tech_pct": round(tech_pct, 2),
+        "fallback_ok": fallback_ok,
+        "by_marker": dict(tech_by_marker),
+    }
+
+    tips_by_fio = {}
+    tips_by_org = {}
+    fio_list = []
+    org_list = {}
+
+    if egrul:
+        print("[i] тултипы на ФИО...")
+        fio_list = build_fio_list(egrul, min_orgs=2)
+        for f in fio_list:
+            tips_by_fio[f["inn"]] = build_fio_tooltip(egrul, f["fio"], f["inn"])
+
+        print("[i] тултипы на ЮЛ...")
+        for ogrn in egrul.entities:
+            tip = build_org_tooltip(egrul, ogrn)
+            if tip:
+                tips_by_org[ogrn] = tip
+
+        for ogrn, e in egrul.entities.items():
+            org_list[ogrn] = {
+                "ogrn": ogrn,
+                "name": egrul.display_name(ogrn),
+                "form": egrul.display_form(ogrn),
+            }
 
     data_js = json.dumps(records, ensure_ascii=False)
-    org_js = json.dumps(org_stats, ensure_ascii=False)
-    summary_js = json.dumps(org_summary, ensure_ascii=False)
-    egrul_js = json.dumps(egrul_for_html, ensure_ascii=False)
-    egrul_lost_js = json.dumps(egrul_lost, ensure_ascii=False)
-    mass_min_js = str(MASS_DATE_MIN)
-    mass_hint_js = json.dumps(MASS_DATE_HINT, ensure_ascii=False)
+    summary_js = json.dumps(
+        {k: {**v, "ogrns": sorted(v.get("ogrns") or [])} for k, v in org_summary.items()},
+        ensure_ascii=False,
+    )
+    tips_fio_js = json.dumps(tips_by_fio, ensure_ascii=False)
+    tips_org_js = json.dumps(tips_by_org, ensure_ascii=False)
+    org_list_js = json.dumps(org_list, ensure_ascii=False)
+    fio_list_js = json.dumps([{"fio": f["fio"], "inn": f["inn"]} for f in fio_list], ensure_ascii=False)
+    tech_js = json.dumps(tech_state, ensure_ascii=False)
 
-    html_text = (HTML_TEMPLATE
-                 .replace("__DATA__", data_js)
-                 .replace("__ORG_STATS__", org_js)
-                 .replace("__ORG_SUMMARY__", summary_js)
-                 .replace("__EGRUL_ENTITIES__", egrul_js)
-                 .replace("__EGRUL_LOST__", egrul_lost_js)
-                 .replace("__MASS_DATE_MIN__", mass_min_js)
-                 .replace("__MASS_DATE_HINT__", mass_hint_js))
+    npa_path = NPA_LIST.resolve().as_posix()
+    dl_path = DL_ERRORS.resolve().as_posix()
 
-    OUT_HTML.write_text(html_text, encoding="utf-8")
+    html = (HTML_TEMPLATE
+            .replace("__DATA__", data_js)
+            .replace("__ORG_SUMMARY__", summary_js)
+            .replace("__TIPS_BY_FIO__", tips_fio_js)
+            .replace("__TIPS_BY_ORG__", tips_org_js)
+            .replace("__ORG_LIST__", org_list_js)
+            .replace("__FIO_LIST__", fio_list_js)
+            .replace("__TECH_STATE__", tech_js)
+            .replace("__NPA_LIST_PATH__", npa_path)
+            .replace("__DL_ERRORS_PATH__", dl_path))
+
+    OUT_HTML.write_text(html, encoding="utf-8")
     print(f"[+] report: {OUT_HTML}")
+
+    NPA_LIST.write_text(NPA_TEXT, encoding="utf-8")
+    print(f"[+] npa_list: {NPA_LIST}")
+
+    DL_ERRORS.write_text(DL_HEADER, encoding="utf-8")
+    print(f"[+] download_errors: {DL_ERRORS}")
+
+    if not args.no_trash:
+        trash_unused_png(records)
+    else:
+        print("[i] очистка PNG пропущена (--no-trash)")
+
 
 if __name__ == "__main__":
     main()
