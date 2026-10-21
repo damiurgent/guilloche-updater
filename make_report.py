@@ -22,7 +22,6 @@ try:
 except ImportError:
     msvcrt = None
 
-# ============================== ПРАЗДНИКИ ==============================
 try:
     import holidays as _holidays
     RU_HOLIDAYS = _holidays.RU(years=range(2000, 2032))
@@ -44,13 +43,11 @@ DOWNLOAD_ERRORS_SRC = SCRIPT_DIR / "download_errors.log"
 DOWNLOAD_ERRORS_DST = IMG_DIR / "download_errors.log"
 AVAR_TXT = SCRIPT_DIR / "avar.txt"
 OGRNS_LOST_TXT = SCRIPT_DIR / "ogrns_lost.txt"
+GRAPHS_JSON = SCRIPT_DIR / "graphs.json"
 
-# Основная база — старая (там у всех директора)
 EGRUL_XML = Path(r"D:\DB\XML\egrul_omsk_deep_final.xml")
 EGRUL_SHORT_XML = Path(r"D:\DB\XML\egrul_omsk_deep_final_short.xml")
-# «Потерянные» — из нового парсера PDF
 EGRUL_LOST_SHORT_XML = Path(r"D:\DB\XML\egrul_parse_deep_pdf_lost_short.xml")
-
 TRASH_DIR = Path(r"D:\IN\OLD\IMG")
 
 BLACKLIST_OGRN = {
@@ -63,7 +60,7 @@ BLACKLIST_OGRN = {
 MARKER_LONG = {
     "Н": "Подпись верна, но НЕДЕЙСТВИТЕЛЬНА",
     "Ж": "Подпись НЕВЕРНА и НЕДЕЙСТВИТЕЛЬНА",
-    "Э": "Подпись ОТСУТСТВУЕТ",
+    "Э": "Информация ПРОТИВОРЕЧИВА или нет ЭП",
     "О": "Информация о договоре НЕ РАЗМЕЩЕНА",
 }
 MASS_DATE_MIN = 2
@@ -81,7 +78,7 @@ MASS_DATE_HINT = (
     "документах ведёт к необоснованному увеличению платежей собственников."
 )
 
-# ============================== ИНТЕРАКТИВНЫЙ ОПРОС ==============================
+# ============================== ОПРОС ==============================
 def ask_yes_no(prompt, default="n", timeout=10):
     default = default.lower()
     print(f"{prompt} (y/n) [{default}] — таймаут {timeout}с: ", end="", flush=True)
@@ -137,7 +134,7 @@ def run_script(script_name):
         print(f"[!] Ошибка запуска {script_name}: {e}")
         return False
 
-# ============================== ПАРСИНГ PNG ==============================
+# ============================== PNG ==============================
 def read_png_chunks(img_path: Path) -> dict:
     if not img_path.exists(): return {}
     texts = {}
@@ -187,7 +184,7 @@ def extract_areas_from_desc(desc: str):
 
     total = get_val(r"Общая площадь дома,?\s*кв\.?м:?\s*([\d\.\,]+)")
     living = get_val(r"Общая площадь жилых помещений,?\s*кв\.?м:?\s*([\d\.\,]+)")
-    non_living = get_val(r"Общая площадь нежилых помещений,?\s*кв\.?м:?\s*([\d\.\,]+)")
+    non_living = get_val(r"Общая площадь нежилых помещений,?\s*кв\.м:?\s*([\d\.\,]+)")
     return total, living, non_living
 
 # ============================== OGRNS_LOST ==============================
@@ -235,14 +232,11 @@ def load_egrul_short_data(xml_path: Path) -> dict:
         address = (ent.findtext("address") or "").strip()
         term_date = (ent.findtext("termination_date") or "").strip()
         ul_inn = (ent.findtext("ul_inn") or "").strip()
+        capital = (ent.findtext("capital") or "").strip()
         result[ogrn] = {
-            "ogrn": ogrn,
-            "name": name,
-            "director": director,
-            "director_inn": dir_inn,
-            "address": address,
-            "termination_date": term_date,
-            "ul_inn": ul_inn,
+            "ogrn": ogrn, "name": name, "director": director,
+            "director_inn": dir_inn, "address": address,
+            "termination_date": term_date, "ul_inn": ul_inn, "capital": capital
         }
     return result
 
@@ -258,7 +252,7 @@ def load_avar(path: Path) -> set:
     except Exception: pass
     return result
 
-# ============================== ПАРСИНГ contracts*.log ==============================
+# ============================== КОНТРАКТЫ ==============================
 RE_SCR = r"scr(?:\d{6}|XXXX)\.png"
 RE_LINE1 = re.compile(r"^(" + RE_SCR + r")\s*-\s*(.+?)\s*--\s*(.+?)\s*---\s*(.+?)\s*----\s*(.+)$")
 RE_LINE2 = re.compile(r"^(" + RE_SCR + r")\s*-\s*(?:(.+?)\s*--\s*)?(.+)$")
@@ -347,7 +341,7 @@ def parse_contracts_logs():
             result.append(r)
     return result
 
-# ============================== ПАРСИНГ gisjkh-ufo*.log ==============================
+# ============================== GISJHK ==============================
 RE_HOUSE_INFO = re.compile(
     r"house_info:\s+"
     r"(?=.*?\borg='([^']*)')"
@@ -387,7 +381,7 @@ def _bump(stats: dict, org: str, marker: str):
     stats[org]["total"] += 1
     stats[org][marker] = stats[org].get(marker, 0) + 1
 
-# ============================== МАССОВЫЕ ДАТЫ ==============================
+# ============================== АНАЛИТИКА ==============================
 def compute_mass_date_per_org(records):
     counts_per_org = {}
     for r in records:
@@ -403,7 +397,6 @@ def compute_mass_date_per_org(records):
         if mass: result[org] = mass
     return result
 
-# ============================== НОРМАЛИЗАЦИЯ И ПРИВЯЗКА Д ==============================
 def _norm_org(s: str) -> str:
     if not s: return ""
     s = s.upper().strip().replace("«", '"').replace("»", '"').replace("<", '"').replace(">", '"')
@@ -429,8 +422,7 @@ def _match_d_per_org(records, org_stats):
         result[raw_org] = max(result.get(raw_org, 0), d_here)
     return result
 
-# ============================== СВОДКА ПО УК ==============================
-def compute_org_summary(records, org_stats, mass_per_org, egrul_directors):
+def compute_org_summary(records, org_stats, mass_per_org, egrul_directors, egrul_full_all):
     summary = {}
     for r in records:
         org = r["org"]
@@ -439,7 +431,7 @@ def compute_org_summary(records, org_stats, mass_per_org, egrul_directors):
                 "org": org, "addr_count": 0, "n_count": 0, "j_count": 0,
                 "e_count": 0, "o_count": 0, "mass_date": "", "mass_count": 0,
                 "mass_dates": {}, "trust": 0.0, "holiday_count": 0,
-                "ogrns": [], "director": "",
+                "ogrns": [], "director": "", "capital": "",
                 "odi_neg_count": 0, "odi_neg_sum": 0.0
             }
         s = summary[org]
@@ -474,7 +466,11 @@ def compute_org_summary(records, org_stats, mass_per_org, egrul_directors):
             s["mass_dates"] = mass
 
         s["ogrns"] = sorted(s["ogrns"])[:1]
-        if s["ogrns"]: s["director"] = egrul_directors.get(s["ogrns"][0], "")
+        if s["ogrns"]:
+            ogrn = s["ogrns"][0]
+            s["director"] = egrul_directors.get(ogrn, "")
+            if ogrn in egrul_full_all:
+                s["capital"] = egrul_full_all[ogrn].get("capital", "")
     return summary
 
 # ============================== HTML-ШАБЛОН ==============================
@@ -493,14 +489,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   .legal h2 { font-size: 14px; margin: 0 0 8px 0; }
   .legal ul { margin: 0 0 8px 0; padding-left: 20px; }
   table { border-collapse: collapse; background: #fff; width: 100%;
-          box-shadow: 0 1px 4px rgba(0,0,0,0.1); table-layout: fixed; }
-th:nth-child(2) { width: 30%; }   /* Организации */
-th:nth-child(3) { width: 45%; }   /* Адрес */
-th:nth-child(4) { width: 7%; }   /* Дата */
-th:nth-child(5) { width: 15%; }   /* Результат ЭП */
-th:nth-child(6) { width: 18%; }   /* Протокол */
+          box-shadow: 0 1px 4px rgba(0,0,0,0.1); }
+  th:nth-child(1) { width: 28px; }
+  th:nth-child(2) { min-width: 320px; }
+  th:nth-child(3) { min-width: 280px; }
+  th:nth-child(6) { width: 200px; }
   th, td { border: 1px solid #ddd; padding: 6px 8px; font-size: 13px;
-           vertical-align: top; word-wrap: break-word; }
+           vertical-align: top; word-wrap: break-word; overflow-wrap: anywhere; }
   th { background: #eaeaea; cursor: pointer; user-select: none;
        position: sticky; top: 0; }
   th:hover { background: #ddd; }
@@ -624,36 +619,25 @@ th:nth-child(6) { width: 18%; }   /* Протокол */
 </div>
 <div class="meta">
   Записей: <span id="count">0</span>.<br>
-  <b>Расшифровка маркеров столбца «Результат проверки ЭП»:</b>
-  <b>Н/Д</b> — подпись верна, но НЕДЕЙСТВИТЕЛЬНА;
-  <b>Н/В</b> — подпись НЕВЕРНА и НЕДЕЙСТВИТЕЛЬНА;
-  <b>Н/Э</b> — подпись ОТСУТСТВУЕТ;
-  <b>Н/О</b> — информация о договоре НЕ РАЗМЕЩЕНА.
-  В отчёт не попадает только Д (подпись ДЕЙСТВИТЕЛЬНА) — Д идёт исключительно в статистику уровня доверия.<br>
-  <b>Уровень доверия</b> по УК = Д / (Д + Н/Д + Н/В + Н/Э + Н/О) × 100%, где Д — дома с действительной ЭП, остальные — из расшифровки выше. Цвет — по тепловой шкале (голубой = высокий, бордовый = низкий). Сортировка по умолчанию — по уровню доверия <b>↑</b> (аутсайдеры сверху).<br>
+  <b>Уровень доверия</b> по УК = Д / (Д + Н/Д + Н/В + Н/Э + Н/О) × 100%. Цвет — по тепловой шкале (голубой = высокий, бордовый = низкий). Сортировка по умолчанию — по уровню доверия <b>↑</b> (аутсайдеры сверху). В отчёт не попадает только Д (подпись ДЕЙСТВИТЕЛЬНА) — Д идёт исключительно в статистику уровня доверия.<br>
+  <b>Уставный капитал</b> указан рядом с ОГРН и окрашен по тепловой шкале (от бордового < 10 000 руб до голубого > 1 000 000 руб).<br>
   <b>Массовые одинаковые даты заключения договоров</b> (у одной УК, ≥<span id="mass_min">2</span> раз): в свёрнутой строке УК показана дата с максимальным числом повторов, в раскрытых строках домов пастелью подсвечены <b>все</b> такие даты.<br>
-  <b>Формула исчисления площадей в МКД:</b> 
-  <span class="area-result">S<sub>оди</sub> = </span>
-  <span class="area-total">S<sub>общ</sub></span> − 
-  <span class="area-living">S<sub>жил</sub></span> − 
-  <span class="area-nonliving">S<sub>нежил</sub></span> 
-  (ст. 15 ЖК РФ).
-  <br><span class="area-total">S<sub>общ</sub></span> − общая площадь, 
-  <span class="area-living">S<sub>жил</sub></span> − площадь жилых помещений, 
-  <span class="area-nonliving">S<sub>нежил</sub></span> − площадь нежилых помещений.
-  <br>Если результат <b>отрицательный</b>, справа от адреса выводится формула с подставленными цифрами и вопросом <i>«Это S<sub>оди</sub>?»</i>.<br>
-  <b>ОГРН.</b> Если из скана договора удалось распознать иной ОГРН, он выводится серым шрифтом 7pt справа от кнопки «Смотреть».
+  <b>Адрес МКД</b> является также ссылкой на Информация об управлении МКД на портале ГИС ЖКХ.<br>
+  <b>Формула исчисления площадей в МКД:</b> <span class="area-result">S<sub>оди</sub> = </span> <span class="area-total">S<sub>общ</sub></span> − <span class="area-living">S<sub>жил</sub></span> − <span class="area-nonliving">S<sub>нежил</sub></span> (ст. 15 ЖК РФ). Если результат <b>отрицательный</b>, справа от адреса выводится формула с подставленными из ГИС ЖКХ цифрами.<br>
+  <b>Расшифровка маркеров столбца «Результат проверки ЭП»:</b> <b>Н/Д</b> — подпись верна, но НЕДЕЙСТВИТЕЛЬНА; <b>Н/В</b> — подпись НЕВЕРНА и НЕДЕЙСТВИТЕЛЬНА; <b>Н/Э</b> — информация ПРОТИВОРЕЧИВА или нет ЭП; <b>Н/О</b> — информация о договоре НЕ РАЗМЕЩЕНА.<br>
+  Если из скана договора удалось распознать иное ЮЛ, оно выводится рядом с кнопкой «Смотреть».<br>
+  <b>Предположительный граф аффилированности</b> показывается подсказкой при наведении курсора на ЮЛ или ФИО в первом и последнем столбцах.
 </div>
 
 <table id="tbl">
   <thead>
     <tr>
       <th class="col-toggle"></th>
-      <th data-key="trust">Организации по уровню доверия<span class="arrow"></span></th>
-      <th data-key="addr">Адрес<span class="arrow"></span></th>
+      <th data-key="trust">Организация по уровню доверия (ОГРН; уст. капитал; Руководитель)<span class="arrow"></span></th>
+      <th data-key="addr">Адрес (расчёт площадей)<span class="arrow"></span></th>
       <th data-key="date">Дата заключения ДУ с УК<span class="arrow"></span></th>
       <th data-key="marker">Результат проверки ЭП<span class="arrow"></span></th>
-      <th class="no-sort">Протокол проверки</th>
+      <th class="no-sort">Протокол проверки (иное ЮЛ)</th>
     </tr>
   </thead>
   <tbody id="tbody"></tbody>
@@ -664,20 +648,21 @@ th:nth-child(6) { width: 18%; }   /* Протокол */
 </div>
 
 <div class="legal">
-  <h2>Дисклеймер</h2>
-  <p>Отчёт сформирован автоматически по результатам программного опроса открытых источников — портала ГИС ЖКХ. Единственный источник данных — ГИС ЖКХ на момент прогона. Отчёт не является юридическим заключением и не заменяет собой проверку, проводимую уполномоченными органами.</p>
-  <h2>Возможные правовые последствия выявленных фактов (справочно)</h2>
-  <p>Ниже перечислены нормы, сопоставимые с описанными ситуациями. Формулировки даны в осторожном ключе: факт может содержать признаки соответствующего состава, что устанавливается компетентным органом.</p>
+  <h2>Отказ от ответственности.</h2>
+  <p>Отчёт сформирован автоматически по результатам программного опроса открытых источников — порталов ГИС ЖКХ и ЕГРЮЛ. Логика отчёта выстроена с помощью искусственного интеллекта. Отчёт не является юридическим заключением и не заменяет собой проверку, проводимую уполномоченными органами.</p>
+
+  <h2>Перечень нормативных правовых актов</h2>
   <ul>
-    <li>ст. 159, 159.2 УК РФ — мошенничество, в том числе при получении выплат;</li>
-    <li>ст. 272 УК РФ — неправомерный доступ к компьютерной информации;</li>
-    <li>ст. 327 УК РФ — подделка, изготовление или оборот поддельных документов;</li>
-    <li>ст. 20.4 КоАП РФ — нарушение требований пожарной безопасности (в части сопутствующих нарушений);</li>
-    <li>Федеральный закон № 63-ФЗ «Об электронной подписи» — требования к квалифицированной электронной подписи;</li>
-    <li>Постановление Правительства РФ № 491 — Правила содержания общего имущества;</li>
-    <li>Постановление Правительства РФ № 354 — Правила предоставления коммунальных услуг;</li>
-    <li>Жилищный кодекс РФ — требования к раскрытию информации управляющими организациями;</li>
-    <li>ч. 4 ст. 29 Конституции РФ — длящийся ущерб неимущественному праву неопределённого круга лиц на доступ к объективной информации.</li>
+    <li>Конституция Российской Федерации.</li>
+    <li>Жилищный кодекс Российской Федерации.</li>
+    <li>Гражданский кодекс Российской Федерации (ст. 160, 432, 388, 391, 1102).</li>
+    <li>Федеральный закон от 21.07.2014 № 209-ФЗ «О государственной информационной системе жилищно-коммунального хозяйства» (п. 8 ст. 4, п. 4 ст. 5).</li>
+    <li>Федеральный закон от 27.07.2006 № 149-ФЗ «Об информации, информационных технологиях и о защите информации» (ч. 9 ст. 14).</li>
+    <li>Федеральный закон от 06.04.2011 № 63-ФЗ «Об электронной подписи».</li>
+    <li>Кодекс Российской Федерации об административных правонарушениях (ст. 20.4).</li>
+    <li>Уголовный кодекс Российской Федерации (ст. 159, 159.2, 272, 327).</li>
+    <li>Постановление Правительства РФ от 13.08.2006 № 491 «Об утверждении Правил содержания общего имущества в многоквартирном доме…».</li>
+    <li>Постановление Правительства РФ от 06.05.2011 № 354 «О предоставлении коммунальных услуг собственникам и пользователям помещений…».</li>
   </ul>
 </div>
 
@@ -693,6 +678,7 @@ th:nth-child(6) { width: 18%; }   /* Протокол */
 </div>
 
 <div id="hint-tooltip"></div>
+<div id="tip" style="position:fixed; z-index:10000; background:#fff; border:1px solid #c8c8c8; border-radius:5px; padding:6px 8px; font-family:Consolas,monospace; font-size:7pt; line-height:1.3; max-width:95vw; box-shadow:0 6px 22px rgba(0,0,0,0.18); pointer-events:none; display:none; overflow:hidden;"></div>
 
 <script>
 const DATA = __DATA__;
@@ -700,43 +686,14 @@ const ORG_STATS_BACKEND = __ORG_STATS__;
 const ORG_SUMMARY_BACKEND = __ORG_SUMMARY__;
 const EGRUL_ENTITIES = __EGRUL_ENTITIES__;
 const EGRUL_LOST = __EGRUL_LOST__;
+const GRAPHS = __GRAPHS__;
 const MASS_DATE_MIN = __MASS_DATE_MIN__;
 const MASS_DATE_HINT = __MASS_DATE_HINT__;
 
 // ============================================================
-// ИНДЕКСЫ ЕГРЮЛ ДЛЯ ТУЛТИПОВ
+// ИНДЕКСЫ ДЛЯ ТУЛТИПОВ
 // ============================================================
-const directorIndex = new Map();
-const founderIndex  = new Map();
-const orgByOgrn     = new Map();
-
-for (const e of Object.values(EGRUL_ENTITIES)) {
-  orgByOgrn.set(e.ogrn, {...e, founders: e.founders || []});
-  if (e.director_inn && e.director) {
-    if (!directorIndex.has(e.director_inn))
-      directorIndex.set(e.director_inn, {fio: e.director, entities: []});
-    directorIndex.get(e.director_inn).entities.push(e);
-  }
-  for (const f of (e.founders || [])) {
-    if (!f.inn) continue;
-    if (!founderIndex.has(f.inn))
-      founderIndex.set(f.inn, {fio: f.name, entities: []});
-    founderIndex.get(f.inn).entities.push(e);
-  }
-}
-
-for (const [ogrn, e] of Object.entries(EGRUL_LOST)) {
-  if (!orgByOgrn.has(ogrn)) {
-    orgByOgrn.set(ogrn, {
-      ogrn: ogrn,
-      name: e.name,
-      director: e.director,
-      director_inn: "",
-      address: "",
-      founders: [],
-    });
-  }
-}
+// Нам больше не нужно строить связи в JS, мы берём готовые GRAPHS из build_graphs.py
 
 // Обратный индекс: ИНН → организация (для mismatch по ИНН)
 const orgByInn = new Map();
@@ -747,156 +704,21 @@ for (const e of Object.values(EGRUL_LOST)) {
   if (e.ul_inn && !orgByInn.has(e.ul_inn)) orgByInn.set(e.ul_inn, e);
 }
 
-const personsByOrg = new Map();
-for (const e of Object.values(EGRUL_ENTITIES)) {
-  const m = new Map();
-  if (e.director_inn && e.director) m.set(e.director_inn, {fio: e.director, role: "директор"});
-  for (const f of (e.founders || [])) {
-    if (!f.inn) continue;
-    if (m.has(f.inn)) {
-      const cur = m.get(f.inn);
-      if (cur.role === "директор") cur.role = "директор, учредитель";
-    } else {
-      m.set(f.inn, {fio: f.name, role: "учредитель"});
-    }
-  }
-  personsByOrg.set(e.ogrn, m);
-}
-
 // ============================================================
-// АДРЕСА
+// ВЫВОД ТУЛТИПОВ
 // ============================================================
-function normAddress(s) {
-  return String(s || "")
-    .toUpperCase()
-    .replace(/Ё/g, "Е")
-    .replace(/Г\.О\.\s*ГОРОД ОМСК,?\s*Г\.\s*ОМСК,?\s*/g, "")
-    .replace(/ОМСКАЯ ОБЛАСТЬ,?\s*/g, "")
-    .replace(/СТРАНИЦА\s+\d+\s+ИЗ.*$/g, "")
-    .replace(/\s+/g, " ")
-    .trim()
-    .replace(/,$/, "");
-}
-function addrType(norm) {
-  return /(^|[\s,])(КВ\.|КВАРТИРА|КОМ\.)/.test(norm) ? "home" : "office";
-}
-
-const addressIndex = new Map();
-for (const e of Object.values(EGRUL_ENTITIES)) {
-  if (!e.address) continue;
-  const norm = normAddress(e.address);
-  if (!norm) continue;
-  if (!addressIndex.has(norm)) {
-    addressIndex.set(norm, {display: e.address, type: addrType(norm), entities: []});
-  }
-  addressIndex.get(norm).entities.push(e);
-}
-
-// ============================================================
-// СВЯЗИ ЮЛ ↔ ЮЛ ЧЕРЕЗ ПЕРСОН (1 шаг)
-// ============================================================
-function orgNeighborsByPerson(org) {
-  const result = new Map();
-  const persons = personsByOrg.get(org.ogrn) || new Map();
-  for (const [inn, p] of persons) {
-    const dir = directorIndex.get(inn);
-    if (dir) {
-      for (const e of dir.entities) {
-        if (e.ogrn === org.ogrn) continue;
-        addNeighbor(result, e, p.fio, inn, "директор");
-      }
-    }
-    const fnd = founderIndex.get(inn);
-    if (fnd) {
-      for (const e of fnd.entities) {
-        if (e.ogrn === org.ogrn) continue;
-        addNeighbor(result, e, p.fio, inn, "учредитель");
-      }
-    }
-  }
-  return result;
-}
-function addNeighbor(map, org, fio, inn, role) {
-  if (!map.has(org.ogrn)) map.set(org.ogrn, {org, persons: []});
-  const item = map.get(org.ogrn);
-  const exists = item.persons.some(p => p.inn === inn && p.role === role);
-  if (!exists) item.persons.push({fio, inn, role});
-}
-
-// ============================================================
-// ПОСТРОЕНИЕ СТРОК ТУЛТИПА
-// ============================================================
-function roleLabelFor(e, inn) {
-  const isDir = e.director_inn === inn;
-  const isF  = (e.founders || []).some(f => f.inn === inn);
-  if (isDir && isF) return "директор, учредитель";
-  if (isDir) return "директор";
-  return "учредитель";
-}
-
-function buildFioTooltip(fio, inn) {
-  const lines = [{type:"title", text:`Предположительный граф аффилированности`}];
-  const map = new Map();
-  const dir = directorIndex.get(inn);
-  const found = founderIndex.get(inn);
-  if (dir) dir.entities.forEach(e => map.set(e.ogrn, e));
-  if (found) found.entities.forEach(e => map.set(e.ogrn, e));
-  const list = [...map.values()].sort((a, b) => a.name.localeCompare(b.name, "ru"));
-  list.forEach((e, i) => {
-    const last = i === list.length - 1;
-    const tree = last ? "└──" : "├──";
-    lines.push({type:"line", text:`${tree} ${e.name} (${e.ogrn}) — ${roleLabelFor(e, inn)}`});
-  });
-  return lines;
-}
-
-function buildOrgTooltip(org) {
-  const lines = [{type:"title", text:`Предположительный граф аффилированности`}];
-  const nbr = orgNeighborsByPerson(org);
-  const nbrArr = [...nbr.values()].sort((a, b) => a.org.name.localeCompare(b.org.name, "ru"));
-  if (nbrArr.length > 0) {
-    lines.push({type:"sect", text:`Связи через персон:`});
-    nbrArr.forEach((item, idx) => {
-      const last = idx === nbrArr.length - 1;
-      const tree = last ? "└──" : "├──";
-      lines.push({type:"line", text:`${tree} ${item.org.name} (${item.org.ogrn})`});
-      item.persons.forEach(p => {
-        lines.push({type:"who", text:`      через ${p.fio} (${p.inn}) — ${p.role}`});
-      });
-    });
-  }
-  const norm = normAddress(org.address);
-  const bucket = addressIndex.get(norm);
-  if (bucket) {
-    const addrNeighbors = bucket.entities.filter(e => e.ogrn !== org.ogrn);
-    if (addrNeighbors.length > 0) {
-      lines.push({type:"sect", text:`По «резиновому» офису:`});
-      const typeLabel = bucket.type === "home" ? "жилой адрес" : "офис";
-      lines.push({type:"line", text:`  ${bucket.display} (${typeLabel})`});
-      const sorted = [...addrNeighbors].sort((a, b) => a.name.localeCompare(b.name, "ru"));
-      sorted.forEach((e, i) => {
-        const last = i === sorted.length - 1;
-        const tree = last ? "  └──" : "  ├──";
-        lines.push({type:"line", text:`${tree} ${e.name} (${e.ogrn})`});
-      });
-    }
-  }
-  if (lines.length === 1) return null;
-  return lines;
-}
+const tipEl = document.getElementById("tip");
 
 function renderTipHtml(lines) {
   const out = [];
   for (const ln of lines) {
-    if (ln.type === "title") out.push(`<div class="title">${esc(ln.text)}</div>`);
-    else if (ln.type === "sect") out.push(`<div class="sect">${esc(ln.text)}</div>`);
-    else if (ln.type === "who") out.push(`<div class="who">${esc(ln.text)}</div>`);
-    else out.push(`<div class="line">${esc(ln.text)}</div>`);
+    if (ln.type === "title") out.push(`<div style="color:#0b5cad; font-weight:700; margin-bottom:3px; font-family:sans-serif; font-size:7pt;">${esc(ln.text)}</div>`);
+    else if (ln.type === "sect") out.push(`<div style="color:#666; font-weight:600; margin:3px 0 1px 0; font-size:7pt;">${esc(ln.text)}</div>`);
+    else if (ln.type === "who") out.push(`<div style="color:#444; white-space:pre; font-size:7pt;">${esc(ln.text)}</div>`);
+    else out.push(`<div style="color:#222; white-space:pre; font-size:7pt;">${esc(ln.text)}</div>`);
   }
   return out.join("");
 }
-
-const tipEl = document.getElementById("tip");
 
 function positionTip(x, y) {
   const rect = tipEl.getBoundingClientRect();
@@ -911,24 +733,30 @@ function positionTip(x, y) {
 }
 
 function showTipFor(el, x, y) {
-  let lines;
+  let lines = null;
+
   if (el.classList.contains("org-director")) {
-    const inn = el.dataset.inn || "", fio = el.dataset.fio || "";
-    if (!inn || !fio) return;
-    lines = buildFioTooltip(fio, inn);
+    const inn = el.dataset.inn || "";
+    if (inn && GRAPHS.by_fio[inn]) {
+      lines = GRAPHS.by_fio[inn];
+    } else {
+      return; // Если связей нет — тултип не показываем
+    }
   } else if (el.classList.contains("org-name")) {
     const ogrn = el.dataset.ogrn || "";
-    const org = orgByOgrn.get(ogrn);
-    if (!org) return;
-    lines = buildOrgTooltip(org);
-    if (!lines) return;
+    if (GRAPHS.by_org[ogrn]) {
+      lines = GRAPHS.by_org[ogrn];
+    } else {
+      return; // Если связей нет — тултип не показываем
+    }
   } else return;
+  
   tipEl.innerHTML = renderTipHtml(lines);
-  tipEl.classList.add("open");
+  tipEl.style.display = "block";
   positionTip(x, y);
 }
 
-function hideTip() { tipEl.classList.remove("open"); }
+function hideTip() { tipEl.style.display = "none"; }
 
 document.addEventListener("mouseover", (ev) => {
   const el = ev.target.closest(".org-name, .org-director");
@@ -937,7 +765,7 @@ document.addEventListener("mouseover", (ev) => {
 document.addEventListener("mousemove", (ev) => {
   const el = ev.target.closest(".org-name, .org-director");
   if (!el) { hideTip(); return; }
-  if (tipEl.classList.contains("open")) positionTip(ev.clientX, ev.clientY);
+  if (tipEl.style.display === "block") positionTip(ev.clientX, ev.clientY);
 });
 document.addEventListener("mouseout", (ev) => {
   const el = ev.target.closest(".org-name, .org-director");
@@ -947,7 +775,7 @@ document.addEventListener("mouseout", (ev) => {
 });
 
 // ============================================================
-// ДАЛЬШЕ — СУЩЕСТВУЮЩАЯ ЛОГИКА ОТЧЁТА
+// ОСТАЛЬНАЯ ЛОГИКА
 // ============================================================
 let sortKey = "trust", sortAsc = true, slideshowTimer = null;
 const FRAME_MS = 2000;
@@ -978,6 +806,23 @@ function trustColor(trust) {
   if (trust >= 41)   return "hsl(50, 80%, 40%)";
   if (trust >= 21)   return "hsl(30, 85%, 45%)";
   if (trust >= 0.5)  return "hsl(10, 80%, 45%)";
+  return "hsl(350, 70%, 35%)";
+}
+function fmtCapital(v) {
+  if (v == null || v === "") return "";
+  const n = Number(v);
+  if (!isFinite(n)) return "";
+  return n.toLocaleString("ru-RU").replace(/,/g, " ");
+}
+function capitalColor(v) {
+  const n = Number(v);
+  if (!isFinite(n) || n <= 0) return "#888";
+  if (n >= 1000000) return "hsl(200, 70%, 50%)";
+  if (n >= 500000)  return "hsl(140, 60%, 40%)";
+  if (n >= 100000)  return "hsl(80, 65%, 40%)";
+  if (n >= 50000)   return "hsl(50, 80%, 40%)";
+  if (n >= 20000)   return "hsl(30, 85%, 45%)";
+  if (n >= 10000)   return "hsl(10, 80%, 45%)";
   return "hsl(350, 70%, 35%)";
 }
 function hashCode(str) {
@@ -1061,12 +906,21 @@ function render() {
     let dirFio = egrul ? (egrul.director || "").toUpperCase() : "";
     let dirInn = egrul ? (egrul.director_inn || "") : "";
 
+    let capHtml = "";
+    if (s.capital != null && s.capital !== "") {
+      const capFmt = fmtCapital(s.capital);
+      const capColor = capitalColor(s.capital);
+      if (capFmt) {
+        capHtml = " - <span style='color:" + capColor + "; font-weight:bold;'>" + capFmt + " руб</span>";
+      }
+    }
+
     let orgNameHtml = "<span class='org-name'" +
         (orgOgrn ? " data-ogrn='" + esc(orgOgrn) + "'" : "") +
         ">" + esc(org) + "</span>";
     let ogrnHtml = "";
     if (orgOgrn) {
-        ogrnHtml = "<span class='org-ogrn'>ОГРН: " + esc(orgOgrn) + "</span>";
+        ogrnHtml = "<span class='org-ogrn'>ОГРН: " + esc(orgOgrn) + capHtml + "</span>";
     }
     let dirHtml = "";
     if (dirFio) {
@@ -1164,13 +1018,13 @@ function render() {
               let lostDirInn = lostInfo.director_inn || ""; 
 
               let lines = [];
-              if (orgName) lines.push("<span class='org-name' data-ogrn='" + esc(orgOgrn) + "'>" + esc(orgName) + "</span>");
+              if (orgName) lines.push("<span class='org-name' data-lost='1' data-ogrn='" + esc(orgOgrn) + "'>" + esc(orgName) + "</span>");
               lines.push("ОГРН: " + esc(orgOgrn));
               if (orgDir) {
                   if (lostDirInn) {
-                      lines.push("<span class='org-director' data-inn='" + esc(lostDirInn) + "' data-fio='" + esc(orgDir) + "'>" + esc(orgDir) + "</span>");
+                      lines.push("<span class='org-director' data-lost='1' data-inn='" + esc(lostDirInn) + "' data-fio='" + esc(orgDir) + "'>" + esc(orgDir) + "</span>");
                   } else {
-                      lines.push("<span class='org-director'>" + esc(orgDir) + "</span>");
+                      lines.push("<span class='org-director' data-lost='1' data-fio='" + esc(orgDir) + "'>" + esc(orgDir) + "</span>");
                   }
               }
               if (termDate) lines.push(esc(termDate));
@@ -1215,7 +1069,6 @@ function render() {
     });
   });
 
-  // Итоговая строка
   if (globalNegSum < -0.01) {
     const totalAbs = Math.abs(globalNegSum);
     const flats = Math.round(totalAbs / 50);
@@ -1257,10 +1110,7 @@ function openOverlay(record) {
 
   ov.classList.remove("paused");
 
-  const cap = document.getElementById("ov_caption");
-  const fn = document.getElementById("ov_filename");
-  fn.textContent = srcs[0] || "";
-
+  document.getElementById("ov_filename").textContent = srcs[0] || "";
   ov.classList.add("open");
   startSlideshowTimer();
 }
@@ -1307,7 +1157,7 @@ document.getElementById("overlay").addEventListener("click", e => {
   if (!ov.classList.contains("open")) return;
   if (e.target.classList.contains("close")) return;
   if (e.target.tagName === "IMG") togglePause();
-  else if (e.target.id === "overlay" || e.target.classList.contains("frame") || e.target.classList.contains("caption") || e.target.classList.contains("paused-badge")) {
+  else if (e.target.id === "overlay" || e.target.classList.contains("frame") || e.target.classList.contains("caption")) {
     if (e.target.id === "overlay") closeOverlay(); else togglePause();
   }
 });
@@ -1376,10 +1226,12 @@ def main():
     upd_ogrn = ask_yes_no("Обновить поиск ОГРН и ИНН в чанках скринов договоров?", "n", 10)
     upd_pdf  = ask_yes_no("Обновить закачку только новых выписок с egrul.nalog.ru?", "n", 10)
     upd_xml  = ask_yes_no("Обновить две БД (полных и коротких имён) потерянных ЮЛ?", "n", 10)
+    upd_grph = ask_yes_no("Обновить графы аффилированности?", "n", 10)
 
     if upd_ogrn: run_script("find_4scr_ogrn_inn.py")
     if upd_pdf:  run_script("egrul_deep_pdf_lost.py")
     if upd_xml:  run_script("egrul_parse_deep_pdf_lost.py")
+    if upd_grph: run_script("build_graphs.py")
 
     print("\n=== Обновления завершены, генерируем отчёт ===\n")
 
@@ -1389,6 +1241,17 @@ def main():
     egrul_full_all = load_egrul_short_data(EGRUL_SHORT_XML)
     egrul_lost = load_egrul_short_data(EGRUL_LOST_SHORT_XML)
     ogrns_lost_map = load_ogrns_lost(OGRNS_LOST_TXT)
+    
+    graphs_data = {"by_fio": {}, "by_org": {}}
+    if GRAPHS_JSON.exists():
+        try:
+            with open(GRAPHS_JSON, "r", encoding="utf-8") as fh:
+                graphs_data = json.load(fh)
+            print(f"[+] graphs.json загружен")
+        except Exception as e:
+            print(f"[!] Ошибка чтения graphs.json: {e}")
+    else:
+        print("[!] graphs.json не найден. Тултипы графов будут пустыми.")
 
     avar_set = load_avar(AVAR_TXT)
     print(f"[+] avar.txt -> {len(avar_set)} аварийных адресов")
@@ -1409,7 +1272,6 @@ def main():
 
     egrul_for_html = {o: egrul_full_all[o] for o in used_ogrns if o in egrul_full_all}
 
-    # === ПЛОЩАДИ И ССЫЛКИ ИЗ PNG ===
     for r in records:
         if r.get("scr_a"):
             png_path = IMG_DIR / r["scr_a"]
@@ -1424,7 +1286,6 @@ def main():
             url = chunks.get("Source", "")
             if url: r["house_url"] = url.strip()
 
-    # === ПРИВЯЗКА found_ogrn ИЗ OGRNS_LOST.TXT ===
     for r in records:
         scr_pdf = r.get("scr_pdf") or ""
         if scr_pdf and scr_pdf in ogrns_lost_map:
@@ -1434,9 +1295,8 @@ def main():
 
     org_stats = parse_gisjkh_logs()
     mass_per_org = compute_mass_date_per_org(records)
-    org_summary = compute_org_summary(records, org_stats, mass_per_org, egrul_directors)
+    org_summary = compute_org_summary(records, org_stats, mass_per_org, egrul_directors, egrul_full_all)
 
-    # === СВЕРКА ОГРН/ИНН ===
     for r in records:
         if r.get("found_ogrn"):
             cur_ogrn = ""
@@ -1467,6 +1327,7 @@ def main():
     summary_js = json.dumps(org_summary, ensure_ascii=False)
     egrul_js = json.dumps(egrul_for_html, ensure_ascii=False)
     egrul_lost_js = json.dumps(egrul_lost, ensure_ascii=False)
+    graphs_js = json.dumps(graphs_data, ensure_ascii=False)
     mass_min_js = str(MASS_DATE_MIN)
     mass_hint_js = json.dumps(MASS_DATE_HINT, ensure_ascii=False)
 
@@ -1476,6 +1337,7 @@ def main():
                  .replace("__ORG_SUMMARY__", summary_js)
                  .replace("__EGRUL_ENTITIES__", egrul_js)
                  .replace("__EGRUL_LOST__", egrul_lost_js)
+                 .replace("__GRAPHS__", graphs_js)
                  .replace("__MASS_DATE_MIN__", mass_min_js)
                  .replace("__MASS_DATE_HINT__", mass_hint_js))
 
