@@ -1,6 +1,29 @@
 # -*- coding: utf-8 -*-
 """
 make_report2.py — генератор HTML-отчёта по проверке ЭП договоров УК.
+
+Читает:
+  %TEMP%\IN\LOG\contracts*.log       — блоки домов (УК, адрес, ЭП, маркер, дата)
+  %TEMP%\IN\LOG\gisjkh-ufo*.log      — статусы ГИС ЖКХ (Д / Н / Ж)
+  %TEMP%\IN\IMG\scrXXXXXX.png        — скриншоты (Description, Source в чанках)
+  SCRIPT_DIR\avar.txt                — аварийные адреса (исключаются)
+  SCRIPT_DIR\ogrns_lost.txt          — <ОГРН/ИНН> -- <scr.png>
+  SCRIPT_DIR\fio_lost.txt            — <ФИО> -- <scr.png>
+  SCRIPT_DIR\graphs.json             — графы аффилированности (build_graphs.py)
+  D:\DB\XML\egrul_omsk_deep_final.xml           (полный; director/name в смешанном регистре)
+  D:\DB\XML\egrul_omsk_deep_final_short.xml     (короткий; часто director пустой)
+  D:\DB\XML\egrul_parse_deep_pdf_lost_short.xml (короткий; потерянные ЮЛ)
+
+Ключевые правила:
+  • ФИО в fio_lost.txt уже нормализованы find_4scr_ogrn_inn.py (КАПС, им. падеж).
+    Повторно norm_fio к ним НЕ применяется.
+  • director из XML нормализуется norm_fio (КАПС, им. падеж) — в XML он
+    в смешанном регистре и/или родительном падеже.
+  • Если в коротком XML director пустой — берём из полного XML (fallback).
+  • Приоритет 1 в последнем столбце — чужой ОГРН/ИНН (ogrns_lost.txt).
+  • Приоритет 2 — чужое ФИО (fio_lost.txt), найденное в ЕГРЮЛ у другого ЮЛ.
+    ОГРН в этом случае НЕ выводится (ФИО может быть засвечено в нескольких ОГРН).
+  • Тултип графа ищется по data-inn, а если нет — по data-fio.
 """
 
 import re
@@ -16,6 +39,7 @@ import struct
 from datetime import date as _date
 from pathlib import Path
 from tempfile import gettempdir
+from collections import defaultdict
 
 try:
     import msvcrt
@@ -37,12 +61,13 @@ IMG_DIR = BASE_DIR / "IMG"
 OUT_HTML = IMG_DIR / "report.html"
 
 SCRIPT_DIR = Path(os.environ.get("USERPROFILE", str(Path.home()))) \
-             / "Desktop" / "Selenium" / "make_report2"
+    / "Desktop" / "Selenium" / "make_report2"
 
-DOWNLOAD_ERRORS_SRC = SCRIPT_DIR / "download_errors.log"
-DOWNLOAD_ERRORS_DST = IMG_DIR / "download_errors.log"
+DOWNLOAD_ERRORS_SRC = SCRIPT_DIR / "download_errors.html"
+DOWNLOAD_ERRORS_DST = IMG_DIR / "download_errors.html"
 AVAR_TXT = SCRIPT_DIR / "avar.txt"
 OGRNS_LOST_TXT = SCRIPT_DIR / "ogrns_lost.txt"
+FIO_LOST_TXT = SCRIPT_DIR / "fio_lost.txt"
 GRAPHS_JSON = SCRIPT_DIR / "graphs.json"
 
 EGRUL_XML = Path(r"D:\DB\XML\egrul_omsk_deep_final.xml")
@@ -55,6 +80,17 @@ BLACKLIST_OGRN = {
     "1175543039448", "1175543939918", "1135543629720", "1435543028720",
     "1165583077480", "1195542005087"
 }
+
+# ============================== norm_fio ==============================
+# Нормализует director из XML (смешанный регистр и/или родительный падеж)
+# к виду, в котором хранится fio_lost.txt (КАПС, им. падеж).
+try:
+    sys.path.insert(0, str(SCRIPT_DIR))
+    from find_4scr_ogrn_inn import norm_fio  # type: ignore
+except Exception as _e:
+    print(f"[!] norm_fio не импортирован ({_e}) — ФИО из XML сравниваются как есть")
+    def norm_fio(s: str) -> str:
+        return re.sub(r"\s+", " ", (s or "").upper().replace("Ё", "Е")).strip()
 
 # ============================== НАСТРОЙКИ ==============================
 MARKER_LONG = {
@@ -116,7 +152,6 @@ def ask_yes_no(prompt, default="n", timeout=10):
     answer = (answer or default).strip().lower()
     return answer in ("y", "yes", "д", "да")
 
-
 def run_script(script_name):
     script_dir = Path(__file__).parent
     script_path = script_dir / script_name
@@ -125,7 +160,8 @@ def run_script(script_name):
         return False
     print(f"\n=== Запуск {script_name} ===")
     try:
-        result = subprocess.run([sys.executable, str(script_path)], cwd=str(script_dir), check=False)
+        result = subprocess.run([sys.executable, str(script_path)], cwd=str(script_dir),
+                                check=False)
         if result.returncode != 0:
             print(f"[!] {script_name} завершился с кодом {result.returncode}")
             return False
@@ -164,7 +200,8 @@ def read_png_chunks(img_path: Path) -> dict:
                         if len(parts) >= 2:
                             kw = parts[0].decode('latin-1', errors='replace')
                             texts[kw] = parts[-1].decode('utf-8', errors='replace')
-    except Exception: pass
+    except Exception:
+        pass
     return texts
 
 def parse_area_val(text: str) -> float:
@@ -187,8 +224,8 @@ def extract_areas_from_desc(desc: str):
     non_living = get_val(r"Общая площадь нежилых помещений,?\s*кв\.м:?\s*([\d\.\,]+)")
     return total, living, non_living
 
-# ============================== OGRNS_LOST ==============================
-def load_ogrns_lost(path: Path) -> dict:
+# ============================== OGRNS_LOST / FIO_LOST ==============================
+def _load_two_col_map(path: Path) -> dict:
     result = {}
     if not path.exists(): return result
     try:
@@ -196,11 +233,19 @@ def load_ogrns_lost(path: Path) -> dict:
             for line in fh:
                 line = line.strip()
                 if not line or " -- " not in line: continue
-                num, scr = line.split(" -- ", 1)
-                if num.strip() and scr.strip():
-                    result[scr.strip()] = num.strip()
-    except Exception: pass
+                val, scr = line.split(" -- ", 1)
+                val, scr = val.strip(), scr.strip()
+                if val and scr:
+                    result[scr] = val
+    except Exception:
+        pass
     return result
+
+def load_ogrns_lost(path: Path) -> dict:
+    return _load_two_col_map(path)
+
+def load_fio_lost(path: Path) -> dict:
+    return _load_two_col_map(path)
 
 # ============================== ЕГРЮЛ ==============================
 def load_egrul_directors(xml_path: Path) -> dict:
@@ -249,7 +294,8 @@ def load_avar(path: Path) -> set:
             for line in fh:
                 addr = line.strip()
                 if addr: result.add(addr)
-    except Exception: pass
+    except Exception:
+        pass
     return result
 
 # ============================== КОНТРАКТЫ ==============================
@@ -262,7 +308,9 @@ RE_DATE_DDMMYYYY = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
 RE_FILENAME_OGRN = re.compile(r"^contracts(\d{10,})\.log$")
 RE_SCR_IN_ERRLOG = re.compile(r"(scr\d{6}\.png)")
 
-def _iter_contract_files(): return sorted(LOG_DIR.glob("contracts*.log"), key=lambda p: p.name)
+def _iter_contract_files():
+    return sorted(LOG_DIR.glob("contracts*.log"), key=lambda p: p.name)
+
 def _extract_ogrn(filename: str) -> str:
     m = RE_FILENAME_OGRN.match(filename)
     return m.group(1) if m else ""
@@ -276,7 +324,8 @@ def _is_holiday(date_str: str) -> bool:
     if _HAS_HOLIDAYS and RU_HOLIDAYS is not None:
         try:
             if d in RU_HOLIDAYS: return True
-        except Exception: pass
+        except Exception:
+            pass
     if d.weekday() >= 5: return True
     return False
 
@@ -325,7 +374,10 @@ def parse_contracts_logs():
                 "scr_pdf": screens[3] if len(screens) > 3 else "",
                 "is_holiday": hol, "_mtime": file_mtime,
                 "total_area": 0.0, "living_area": 0.0, "non_living_area": 0.0,
-                "odi_delta": 0.0, "house_url": "", "found_ogrn": "", "is_mismatch": False
+                "odi_delta": 0.0, "house_url": "",
+                "found_ogrn": "", "is_mismatch": False,
+                "found_fio": "", "found_fio_ogrn": "", "found_fio_inn": "",
+                "is_mismatch_fio": False
             })
 
     best = {}
@@ -352,7 +404,8 @@ RE_HOUSE_INFO = re.compile(
 RE_RESULT_MARKER = re.compile(r"result_text:\s*'([^']*)'\s+marker:\s*'([^']*)'")
 RE_RESULT_NONE = re.compile(r"result_text:\s*'ДЕЙСТВИТЕЛЬНА'\s+marker:\s*None")
 
-def _iter_gisjkh_files(): return sorted(LOG_DIR.glob("gisjkh-ufo*.log"), key=lambda p: p.name)
+def _iter_gisjkh_files():
+    return sorted(LOG_DIR.glob("gisjkh-ufo*.log"), key=lambda p: p.name)
 
 def parse_gisjkh_logs():
     stats = {}
@@ -478,11 +531,41 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="utf-8">
-<title>Отчёт по проверке квалифицированной ЭП договоров УК</title>
+<body>
+<div class="epigraph">
+  <div class="epigraph-title">Правовая рамка исследования</div>
+  <p>Согласно <b>п. 8 ст. 4 ФЗ № 209-ФЗ</b>, создание и эксплуатация ГИС ЖКХ осуществляются на основе принципа <i>«полноты, достоверности, актуальности информации и своевременности её размещения»</i>. Согласно <b>п. 4 ст. 5</b>, система должна обеспечивать возможность получения <i>«достоверной и актуальной информации»</i>.</p>
+  <p><b>Ч. 9 ст. 14 ФЗ № 149-ФЗ</b> («Об информации…») прямо устанавливает:</p>
+  <blockquote>«Информация, содержащаяся в государственных информационных системах, является <b>официальной</b>. Государственные органы… <b>обязаны обеспечить достоверность и актуальность</b> информации, содержащейся в данной информационной системе…»</blockquote>
+</div>
 <style>
   body { font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
          margin: 20px; background: #f5f5f5; color: #222; }
-  h1 { font-size: 20px; margin-bottom: 10px; }
+    h1 { font-size: 20px; margin-bottom: 10px; }
+  .epigraph {
+      text-align: right;
+      max-width: 560px;
+      margin: 0 0 18px auto;
+      padding: 10px 14px;
+      border-right: 3px solid #ccc;
+      color: #444;
+      font-size: 12px;
+      line-height: 1.5;
+  }
+  .epigraph-title {
+      font-weight: 700;
+      font-size: 13px;
+      color: #222;
+      margin-bottom: 6px;
+  }
+  .epigraph p { margin: 0 0 8px 0; }
+  .epigraph blockquote {
+      margin: 0;
+      padding: 0 0 0 12px;
+      border-left: 2px solid #ddd;
+      font-style: italic;
+      color: #333;
+  }
   .meta { color: #666; font-size: 13px; margin-bottom: 16px; line-height: 1.5; }
   .legal { color: #444; font-size: 12px; margin-top: 24px; line-height: 1.55;
            border-top: 1px solid #ddd; padding-top: 12px; }
@@ -493,7 +576,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   th:nth-child(1) { width: 28px; }
   th:nth-child(2) { min-width: 320px; }
   th:nth-child(3) { min-width: 280px; }
-  th:nth-child(6) { width: 200px; }
+  th:nth-child(6) { width: 220px; }
   th, td { border: 1px solid #ddd; padding: 6px 8px; font-size: 13px;
            vertical-align: top; word-wrap: break-word; overflow-wrap: anywhere; }
   th { background: #eaeaea; cursor: pointer; user-select: none;
@@ -613,19 +696,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>Отчёт по проверке квалифицированной Электронной Подписи договоров Управляющих Компаний</h1>
+<h1>Отчёт по проверке квалифицированной Электронной Подписи договоров Управляющих Компаний Омской области</h1>
 <div style="margin-bottom:8px;">
   <button id="btn-expand-all" style="padding: 6px 14px; cursor: pointer; border: 1px solid #888; border-radius: 4px; background: #f0f0f0; font-size: 13px;">Развернуть все</button>
 </div>
 <div class="meta">
   Записей: <span id="count">0</span>.<br>
   <b>Уровень доверия</b> по УК = Д / (Д + Н/Д + Н/В + Н/Э + Н/О) × 100%. Цвет — по тепловой шкале (голубой = высокий, бордовый = низкий). Сортировка по умолчанию — по уровню доверия <b>↑</b> (аутсайдеры сверху). В отчёт не попадает только Д (подпись ДЕЙСТВИТЕЛЬНА) — Д идёт исключительно в статистику уровня доверия.<br>
-  <b>Уставный капитал</b> указан рядом с ОГРН и окрашен по тепловой шкале (от бордового < 10 000 руб до голубого > 1 000 000 руб).<br>
+  <b>Уставный капитал</b> указан рядом с ОГРН и окрашен по тепловой шкале (от бордового &lt; 10 000 руб до голубого &gt; 1 000 000 руб).<br>
   <b>Массовые одинаковые даты заключения договоров</b> (у одной УК, ≥<span id="mass_min">2</span> раз): в свёрнутой строке УК показана дата с максимальным числом повторов, в раскрытых строках домов пастелью подсвечены <b>все</b> такие даты.<br>
-  <b>Адрес МКД</b> является также ссылкой на Информация об управлении МКД на портале ГИС ЖКХ.<br>
+  <b>Адрес МКД</b> является также ссылкой на Информацию об управлении МКД на портале ГИС ЖКХ.<br>
   <b>Формула исчисления площадей в МКД:</b> <span class="area-result">S<sub>оди</sub> = </span> <span class="area-total">S<sub>общ</sub></span> − <span class="area-living">S<sub>жил</sub></span> − <span class="area-nonliving">S<sub>нежил</sub></span> (ст. 15 ЖК РФ). Если результат <b>отрицательный</b>, справа от адреса выводится формула с подставленными из ГИС ЖКХ цифрами.<br>
   <b>Расшифровка маркеров столбца «Результат проверки ЭП»:</b> <b>Н/Д</b> — подпись верна, но НЕДЕЙСТВИТЕЛЬНА; <b>Н/В</b> — подпись НЕВЕРНА и НЕДЕЙСТВИТЕЛЬНА; <b>Н/Э</b> — информация ПРОТИВОРЕЧИВА или нет ЭП; <b>Н/О</b> — информация о договоре НЕ РАЗМЕЩЕНА.<br>
-  Если из скана договора удалось распознать иное ЮЛ, оно выводится рядом с кнопкой «Смотреть».<br>
+  <b>В последнем столбце</b>: если из скана удалось распознать иное ЮЛ или ФЛ — оно выводится рядом с кнопкой «Смотреть». Также имеет предположительный граф аффилированности.<br>
   <b>Предположительный граф аффилированности</b> показывается подсказкой при наведении курсора на ЮЛ или ФИО в первом и последнем столбцах.
 </div>
 
@@ -637,19 +720,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <th data-key="addr">Адрес (расчёт площадей)<span class="arrow"></span></th>
       <th data-key="date">Дата заключения ДУ с УК<span class="arrow"></span></th>
       <th data-key="marker">Результат проверки ЭП<span class="arrow"></span></th>
-      <th class="no-sort">Протокол проверки (иное ЮЛ)</th>
+      <th class="no-sort">Протокол проверки (иное ЮЛ или ФЛ)</th>
     </tr>
   </thead>
   <tbody id="tbody"></tbody>
 </table>
 
 <div style="margin-top:16px;">
-  <a id="btn-download-errors" href="download_errors.log" download="download_errors.log" style="display:inline-block; padding:6px 14px; border:1px solid #888; border-radius:4px; background:#f0f0f0; font-size:13px; text-decoration:none; color:#222;">Скачать лог ошибок</a>
+  <a id="btn-download-errors" href="download_errors.html" target="_blank" rel="noopener" style="display:inline-block; padding:6px 14px; border:1px solid #888; border-radius:4px; background:#f0f0f0; font-size:13px; text-decoration:none; color:#222;">Открыть лог ошибок</a>
 </div>
 
 <div class="legal">
   <h2>Отказ от ответственности.</h2>
-  <p>Отчёт сформирован автоматически по результатам программного опроса открытых источников — порталов ГИС ЖКХ и ЕГРЮЛ. Логика отчёта выстроена с помощью искусственного интеллекта. Отчёт не является юридическим заключением и не заменяет собой проверку, проводимую уполномоченными органами.</p>
+    <p>Отчёт сформирован автоматически по результатам программного опроса открытых источников — порталов ГИС ЖКХ и ЕГРЮЛ (<a href="https://my.dom.gosuslugi.ru" target="_blank" rel="noopener">https://my.dom.gosuslugi.ru</a> и <a href="https://e-trust.gosuslugi.ru" target="_blank" rel="noopener">https://e-trust.gosuslugi.ru</a>). Логика отчёта выстроена с помощью искусственного интеллекта. Отчёт не содержит утверждений о виновности конкретных лиц; он демонстрирует методику выявления связей на основе открытых данных. Выводы являются интерпретацией и не заменяют собой решение уполномоченного органа.</p>
 
   <h2>Перечень нормативных правовых актов</h2>
   <ul>
@@ -686,16 +769,11 @@ const ORG_STATS_BACKEND = __ORG_STATS__;
 const ORG_SUMMARY_BACKEND = __ORG_SUMMARY__;
 const EGRUL_ENTITIES = __EGRUL_ENTITIES__;
 const EGRUL_LOST = __EGRUL_LOST__;
+const EGRUL_FULL = __EGRUL_FULL__;
 const GRAPHS = __GRAPHS__;
 const MASS_DATE_MIN = __MASS_DATE_MIN__;
 const MASS_DATE_HINT = __MASS_DATE_HINT__;
 
-// ============================================================
-// ИНДЕКСЫ ДЛЯ ТУЛТИПОВ
-// ============================================================
-// Нам больше не нужно строить связи в JS, мы берём готовые GRAPHS из build_graphs.py
-
-// Обратный индекс: ИНН → организация (для mismatch по ИНН)
 const orgByInn = new Map();
 for (const e of Object.values(EGRUL_ENTITIES)) {
   if (e.ul_inn) orgByInn.set(e.ul_inn, e);
@@ -704,18 +782,15 @@ for (const e of Object.values(EGRUL_LOST)) {
   if (e.ul_inn && !orgByInn.has(e.ul_inn)) orgByInn.set(e.ul_inn, e);
 }
 
-// ============================================================
-// ВЫВОД ТУЛТИПОВ
-// ============================================================
 const tipEl = document.getElementById("tip");
 
 function renderTipHtml(lines) {
   const out = [];
   for (const ln of lines) {
-    if (ln.type === "title") out.push(`<div style="color:#0b5cad; font-weight:700; margin-bottom:3px; font-family:sans-serif; font-size:7pt;">${esc(ln.text)}</div>`);
-    else if (ln.type === "sect") out.push(`<div style="color:#666; font-weight:600; margin:3px 0 1px 0; font-size:7pt;">${esc(ln.text)}</div>`);
-    else if (ln.type === "who") out.push(`<div style="color:#444; white-space:pre; font-size:7pt;">${esc(ln.text)}</div>`);
-    else out.push(`<div style="color:#222; white-space:pre; font-size:7pt;">${esc(ln.text)}</div>`);
+    if (ln.type === "title") out.push('<div style="color:#0b5cad; font-weight:700; margin-bottom:3px; font-family:sans-serif; font-size:7pt;">' + esc(ln.text) + '</div>');
+    else if (ln.type === "sect") out.push('<div style="color:#666; font-weight:600; margin:3px 0 1px 0; font-size:7pt;">' + esc(ln.text) + '</div>');
+    else if (ln.type === "who") out.push('<div style="color:#444; white-space:pre; font-size:7pt;">' + esc(ln.text) + '</div>');
+    else out.push('<div style="color:#222; white-space:pre; font-size:7pt;">' + esc(ln.text) + '</div>');
   }
   return out.join("");
 }
@@ -737,20 +812,23 @@ function showTipFor(el, x, y) {
 
   if (el.classList.contains("org-director")) {
     const inn = el.dataset.inn || "";
+    const fio = (el.dataset.fio || "").toUpperCase();
     if (inn && GRAPHS.by_fio[inn]) {
       lines = GRAPHS.by_fio[inn];
+    } else if (fio && GRAPHS.by_fio[fio]) {
+      lines = GRAPHS.by_fio[fio];
     } else {
-      return; // Если связей нет — тултип не показываем
+      return;
     }
   } else if (el.classList.contains("org-name")) {
     const ogrn = el.dataset.ogrn || "";
     if (GRAPHS.by_org[ogrn]) {
       lines = GRAPHS.by_org[ogrn];
     } else {
-      return; // Если связей нет — тултип не показываем
+      return;
     }
   } else return;
-  
+
   tipEl.innerHTML = renderTipHtml(lines);
   tipEl.style.display = "block";
   positionTip(x, y);
@@ -774,9 +852,6 @@ document.addEventListener("mouseout", (ev) => {
   if (!to || !to.closest || !to.closest(".org-name, .org-director")) hideTip();
 });
 
-// ============================================================
-// ОСТАЛЬНАЯ ЛОГИКА
-// ============================================================
 let sortKey = "trust", sortAsc = true, slideshowTimer = null;
 const FRAME_MS = 2000;
 let slideshowState = { imgs: [], srcs: [], cur: 0, paused: false, activeCount: 0 };
@@ -927,7 +1002,7 @@ function render() {
         if (dirInn) {
             dirHtml = "<span class='org-director' data-inn='" + esc(dirInn) + "' data-fio='" + esc(dirFio) + "'>" + esc(dirFio) + "</span>";
         } else {
-            dirHtml = "<span class='org-director'>" + esc(dirFio) + "</span>";
+            dirHtml = "<span class='org-director' data-fio='" + esc(dirFio) + "'>" + esc(dirFio) + "</span>";
         }
     }
 
@@ -989,7 +1064,7 @@ function render() {
       }
 
       if (odi !== null && odi !== undefined && odi < -0.01) {
-        const formula = 
+        const formula =
             "<span class='area-total'>" + fmtArea(r.total_area) + "</span> - " +
             "<span class='area-living'>" + fmtArea(r.living_area) + "</span> - " +
             "<span class='area-nonliving'>" + fmtArea(r.non_living_area) + "</span> = " +
@@ -1010,12 +1085,25 @@ function render() {
               lostInfo = orgByInn.get(r.found_ogrn);
           }
 
+          if (r.found_ogrn.length === 13) {
+              const full = EGRUL_FULL[r.found_ogrn];
+              if (full) {
+                  if (!lostInfo) lostInfo = {};
+                  lostInfo = Object.assign({}, full, lostInfo, {
+                      director: (lostInfo.director || full.director || "").toUpperCase(),
+                      director_inn: lostInfo.director_inn || full.director_inn || "",
+                      name: lostInfo.name || full.name || "",
+                      termination_date: lostInfo.termination_date || full.termination_date || ""
+                  });
+              }
+          }
+
           if (lostInfo) {
               let orgName = (lostInfo.name || "").toUpperCase();
               let orgOgrn = lostInfo.ogrn || r.found_ogrn;
               let orgDir  = (lostInfo.director || "").toUpperCase();
               let termDate = lostInfo.termination_date ? " (Прекращена: " + lostInfo.termination_date + ")" : "";
-              let lostDirInn = lostInfo.director_inn || ""; 
+              let lostDirInn = lostInfo.director_inn || "";
 
               let lines = [];
               if (orgName) lines.push("<span class='org-name' data-lost='1' data-ogrn='" + esc(orgOgrn) + "'>" + esc(orgName) + "</span>");
@@ -1031,6 +1119,16 @@ function render() {
 
               mismatchHtml = "<div style='color:#000; font-size:7pt; margin-left:10px; display:inline-block; vertical-align:top;'>" + lines.join("<br>") + "</div>";
           }
+      } else if (r.is_mismatch_fio && r.found_fio) {
+          let fio = (r.found_fio || "").toUpperCase();
+          let fioInn = r.found_fio_inn || "";
+          let lines = [];
+          if (fioInn) {
+              lines.push("<span class='org-director' data-lost='1' data-inn='" + esc(fioInn) + "' data-fio='" + esc(fio) + "'>" + esc(fio) + "</span>");
+          } else {
+              lines.push("<span class='org-director' data-lost='1' data-fio='" + esc(fio) + "'>" + esc(fio) + "</span>");
+          }
+          mismatchHtml = "<div style='color:#000; font-size:7pt; margin-left:10px; display:inline-block; vertical-align:top;'>" + lines.join("<br>") + "</div>";
       }
 
       const htr = document.createElement("tr");
@@ -1077,14 +1175,12 @@ function render() {
 
     const trTotal = document.createElement("tr");
     trTotal.className = "total-row";
-    trTotal.innerHTML = 
+    trTotal.innerHTML =
       "<td></td>" +
       "<td><b>ИТОГО по всем УК</b></td>" +
       "<td class='addr-cell'><span class='addr-text'>Сумма отрицательных площадей:</span><span class='addr-delta area-result'>" + fmtOdiDelta(globalNegSum) + "</span></td>" +
       "<td colspan='3' style='color:#666; font-size:12px; line-height: 1.4;'>" +
-        "Это площадь в среднем <b>" + flats + " квартир</b>. " +
-        "При тарифе от 10 до 18 рублей за кв.м такая площадь стоит " +
-        "от <b>" + costMin.toLocaleString('ru-RU') + "</b> до <b>" + costMax.toLocaleString('ru-RU') + "</b> рублей в месяц." +
+        "Это площадь в среднем <b>" + flats.toLocaleString('ru-RU') + " квартир</b>." +
       "</td>";
     tbody.appendChild(trTotal);
   }
@@ -1102,10 +1198,10 @@ function openOverlay(record) {
   srcs.forEach((src, i) => { if (i >= imgs.length) return; imgs[i].src = src; imgs[i].style.display = ""; });
   imgs[0].classList.add("active");
 
-  slideshowState.imgs = imgs; 
+  slideshowState.imgs = imgs;
   slideshowState.srcs = srcs;
-  slideshowState.cur = 0; 
-  slideshowState.paused = false; 
+  slideshowState.cur = 0;
+  slideshowState.paused = false;
   slideshowState.activeCount = Math.min(srcs.length, imgs.length);
 
   ov.classList.remove("paused");
@@ -1201,7 +1297,8 @@ def _collect_used_screens(records):
         try:
             err_text = DOWNLOAD_ERRORS_SRC.read_text(encoding="utf-8", errors="replace")
             for m in RE_SCR_IN_ERRLOG.finditer(err_text): used.add(m.group(1))
-        except Exception: pass
+        except Exception:
+            pass
     return used
 
 def trash_unused_imgs(records):
@@ -1215,7 +1312,8 @@ def trash_unused_imgs(records):
         try:
             target = TRASH_DIR / p.name
             if not target.exists(): shutil.move(str(p), str(target))
-        except Exception: pass
+        except Exception:
+            pass
 
 # ============================== MAIN ==============================
 def main():
@@ -1224,8 +1322,8 @@ def main():
 
     print("=== make_report2 — интерактивный опрос ===")
     upd_ogrn = ask_yes_no("Обновить поиск ОГРН и ИНН в чанках скринов договоров?", "n", 10)
-    upd_pdf  = ask_yes_no("Обновить закачку только новых выписок с egrul.nalog.ru?", "n", 10)
-    upd_xml  = ask_yes_no("Обновить две БД (полных и коротких имён) потерянных ЮЛ?", "n", 10)
+    upd_pdf = ask_yes_no("Обновить закачку только новых выписок с egrul.nalog.ru?", "n", 10)
+    upd_xml = ask_yes_no("Обновить две БД (полных и коротких имён) потерянных ЮЛ?", "n", 10)
     upd_grph = ask_yes_no("Обновить графы аффилированности?", "n", 10)
 
     if upd_ogrn: run_script("find_4scr_ogrn_inn.py")
@@ -1240,8 +1338,12 @@ def main():
 
     egrul_full_all = load_egrul_short_data(EGRUL_SHORT_XML)
     egrul_lost = load_egrul_short_data(EGRUL_LOST_SHORT_XML)
+    egrul_full_deep = load_egrul_short_data(EGRUL_XML)
+    print(f"[+] ЕГРЮЛ (полный, fallback): {EGRUL_XML} -> {len(egrul_full_deep)} записей")
+
     ogrns_lost_map = load_ogrns_lost(OGRNS_LOST_TXT)
-    
+    fio_lost_map = load_fio_lost(FIO_LOST_TXT)
+
     graphs_data = {"by_fio": {}, "by_org": {}}
     if GRAPHS_JSON.exists():
         try:
@@ -1256,6 +1358,7 @@ def main():
     avar_set = load_avar(AVAR_TXT)
     print(f"[+] avar.txt -> {len(avar_set)} аварийных адресов")
     print(f"[+] ogrns_lost.txt -> {len(ogrns_lost_map)} записей")
+    print(f"[+] fio_lost.txt -> {len(fio_lost_map)} записей")
 
     records = parse_contracts_logs()
     if not records: return
@@ -1286,60 +1389,105 @@ def main():
             url = chunks.get("Source", "")
             if url: r["house_url"] = url.strip()
 
+    org_stats = parse_gisjkh_logs()
+    mass_per_org = compute_mass_date_per_org(records)
+    org_summary = compute_org_summary(records, org_stats, mass_per_org,
+                                      egrul_directors, egrul_full_all)
+
+    fio_to_ogrn = defaultdict(list)
+    for ogrn, e in {**egrul_full_all, **egrul_lost}.items():
+        d_raw = (e.get("director") or "").strip()
+        if not d_raw:
+            full = egrul_full_deep.get(ogrn) or {}
+            d_raw = (full.get("director") or "").strip()
+        if not d_raw: continue
+        d = norm_fio(d_raw)
+        if d and ogrn not in fio_to_ogrn[d]:
+            fio_to_ogrn[d].append(ogrn)
+
     for r in records:
         scr_pdf = r.get("scr_pdf") or ""
+
         if scr_pdf and scr_pdf in ogrns_lost_map:
             r["found_ogrn"] = ogrns_lost_map[scr_pdf]
         else:
             r["found_ogrn"] = ""
 
-    org_stats = parse_gisjkh_logs()
-    mass_per_org = compute_mass_date_per_org(records)
-    org_summary = compute_org_summary(records, org_stats, mass_per_org, egrul_directors, egrul_full_all)
-
-    for r in records:
-        if r.get("found_ogrn"):
+        r["found_fio"] = ""
+        r["found_fio_ogrn"] = ""
+        r["found_fio_inn"] = ""
+        if (not r["found_ogrn"]) and scr_pdf and scr_pdf in fio_lost_map:
+            fio = fio_lost_map[scr_pdf]
+            candidates = fio_to_ogrn.get(fio, [])
             cur_ogrn = ""
             if r["org"] in org_summary and org_summary[r["org"]]["ogrns"]:
                 cur_ogrn = org_summary[r["org"]]["ogrns"][0]
+            for cand in candidates:
+                if cand != cur_ogrn:
+                    r["found_fio"] = fio
+                    r["found_fio_ogrn"] = cand
+                    e = egrul_lost.get(cand) or egrul_full_all.get(cand) or {}
+                    inn_cand = (e.get("director_inn") or "")
+                    if not inn_cand:
+                        full = egrul_full_deep.get(cand) or {}
+                        inn_cand = (full.get("director_inn") or "")
+                    r["found_fio_inn"] = inn_cand
+                    break
 
-            fo = r["found_ogrn"]
-            cur_inn = ""
-            if cur_ogrn and cur_ogrn in egrul_for_html:
-                cur_inn = egrul_for_html[cur_ogrn].get("ul_inn") or ""
+    for r in records:
+        cur_ogrn = ""
+        if r["org"] in org_summary and org_summary[r["org"]]["ogrns"]:
+            cur_ogrn = org_summary[r["org"]]["ogrns"][0]
+        cur_inn = ""
+        if cur_ogrn and cur_ogrn in egrul_for_html:
+            cur_inn = egrul_for_html[cur_ogrn].get("ul_inn") or ""
 
+        r["is_mismatch"] = False
+        fo = r.get("found_ogrn") or ""
+        if fo:
             if len(fo) == 10:
-                if cur_inn:
-                    r["is_mismatch"] = (fo != cur_inn)
-                else:
-                    r["is_mismatch"] = False
+                r["is_mismatch"] = (fo != cur_inn) if cur_inn else False
             else:
                 r["is_mismatch"] = (fo != cur_ogrn)
+
+        r["is_mismatch_fio"] = False
+        if (not r["is_mismatch"]) and r.get("found_fio"):
+            cur_dir_raw = ""
+            if cur_ogrn and cur_ogrn in egrul_for_html:
+                cur_dir_raw = (egrul_for_html[cur_ogrn].get("director") or "")
+            if not cur_dir_raw and cur_ogrn:
+                full = egrul_full_deep.get(cur_ogrn) or {}
+                cur_dir_raw = (full.get("director") or "")
+            cur_dir = norm_fio(cur_dir_raw)
+            r["is_mismatch_fio"] = (r["found_fio"].upper() != cur_dir.upper())
 
     if DOWNLOAD_ERRORS_SRC.exists():
         try:
             shutil.copyfile(DOWNLOAD_ERRORS_SRC, DOWNLOAD_ERRORS_DST)
             print(f"[+] download_errors.log → {DOWNLOAD_ERRORS_DST}")
-        except Exception as e: print(f"[!] ошибка: {e}")
+        except Exception as e:
+            print(f"[!] ошибка: {e}")
 
     data_js = json.dumps(records, ensure_ascii=False)
     org_js = json.dumps(org_stats, ensure_ascii=False)
     summary_js = json.dumps(org_summary, ensure_ascii=False)
     egrul_js = json.dumps(egrul_for_html, ensure_ascii=False)
     egrul_lost_js = json.dumps(egrul_lost, ensure_ascii=False)
+    egrul_full_js = json.dumps(egrul_full_deep, ensure_ascii=False)
     graphs_js = json.dumps(graphs_data, ensure_ascii=False)
     mass_min_js = str(MASS_DATE_MIN)
     mass_hint_js = json.dumps(MASS_DATE_HINT, ensure_ascii=False)
 
     html_text = (HTML_TEMPLATE
-                 .replace("__DATA__", data_js)
-                 .replace("__ORG_STATS__", org_js)
-                 .replace("__ORG_SUMMARY__", summary_js)
-                 .replace("__EGRUL_ENTITIES__", egrul_js)
-                 .replace("__EGRUL_LOST__", egrul_lost_js)
-                 .replace("__GRAPHS__", graphs_js)
-                 .replace("__MASS_DATE_MIN__", mass_min_js)
-                 .replace("__MASS_DATE_HINT__", mass_hint_js))
+        .replace("__DATA__", data_js)
+        .replace("__ORG_STATS__", org_js)
+        .replace("__ORG_SUMMARY__", summary_js)
+        .replace("__EGRUL_ENTITIES__", egrul_js)
+        .replace("__EGRUL_LOST__", egrul_lost_js)
+        .replace("__EGRUL_FULL__", egrul_full_js)
+        .replace("__GRAPHS__", graphs_js)
+        .replace("__MASS_DATE_MIN__", mass_min_js)
+        .replace("__MASS_DATE_HINT__", mass_hint_js))
 
     OUT_HTML.write_text(html_text, encoding="utf-8")
     print(f"[+] report: {OUT_HTML}")
