@@ -458,10 +458,11 @@ def snapshot(driver, tag: str, file_stem: str,
 
 def _scroll_banner_away(driver):
     """
-    Прокручивает страницу так, чтобы жёлтый баннер о регламентных
-    работах ушёл за верх вьюпорта. Баннер НЕ удаляется из DOM —
-    в iTXt-чанке Description его текст сохраняется.
-    Если баннер не найден — ничего не делаем.
+    Прокручивает страницу так, чтобы верхняя часть (где обычно висит
+    жёлтый баннер о регламентных работах) ушла за верх вьюпорта.
+    Если баннер найден по тексту — прокручиваем точно под него.
+    Если нет — просто прокручиваем вниз на 200 пикселей.
+    Баннер НЕ удаляется из DOM — в iTXt-чанке Description его текст сохраняется.
     """
     try:
         scrolled = driver.execute_script("""
@@ -479,13 +480,13 @@ def _scroll_banner_away(driver):
                     }
                 }
             }
-            return -1;
+            // Если баннер не найден, принудительно прокручиваем вниз
+            window.scrollBy(0, 200);
+            return 200;
         """)
-        if scrolled is not None and scrolled >= 0:
-            log(f"    [scroll] баннер уведён за вьюпорт (y={scrolled})")
+        if scrolled is not None:
+            log(f"    [scroll] прокрутка выполнена (y={scrolled})")
             time.sleep(0.6)
-        else:
-            log("    [scroll] баннер не найден — оставляем как есть")
     except Exception as e:
         log(f"    [scroll] ошибка: {type(e).__name__}: {e}")
 
