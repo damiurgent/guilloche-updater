@@ -186,10 +186,16 @@ def _normalize_org(raw: str) -> str:
                "ООО", s, flags=re.IGNORECASE)
     s = re.sub(r"АКЦИОНЕРНОЕ\s+ОБЩЕСТВО",
                "АО", s, flags=re.IGNORECASE)
+    s = re.sub(r"МУНИЦИПАЛЬНОЕ\s+УНИТАРНОЕ\s+ПРЕДПРИЯТИЕ",
+               "МУП", s, flags=re.IGNORECASE)
+    s = re.sub(r"МУНИЦИПАЛЬНОЕ\s+ПРОИЗВОДСТВЕННОЕ\s+ПРЕДПРИЯТИЕ",
+               "МПП", s, flags=re.IGNORECASE)
     s = re.sub(r"УПРАВЛЯЮЩАЯ\s+КОМПАНИЯ",
                "УК", s, flags=re.IGNORECASE)
     s = re.sub(r"ЖИЛИЩНО-ЭКСПЛУАТАЦИОННОЕ\s+УПРАВЛЕНИЕ",
                "ЖЭУ", s, flags=re.IGNORECASE)
+    s = re.sub(r"РЕМОНТНО-ЭКСПЛУАТАЦИОННОЕ\s+УПРАВЛЕНИЕ",
+               "РЭУ", s, flags=re.IGNORECASE)
     s = re.sub(r"ЖИЛИЩНО-КОММУНАЛЬНОЕ\s+ХОЗЯЙСТВО",
                "ЖКХ", s, flags=re.IGNORECASE)
     return s.strip()
@@ -458,14 +464,50 @@ def snapshot(driver, tag: str, file_stem: str,
 
 def _scroll_banner_away(driver):
     """
-    Прокручивает страницу так, чтобы верхняя часть (где обычно висит
-    жёлтый баннер о регламентных работах) ушла за верх вьюпорта.
-    Если баннер найден по тексту — прокручиваем точно под него.
-    Если нет — просто прокручиваем вниз на 200 пикселей.
-    Баннер НЕ удаляется из DOM — в iTXt-чанке Description его текст сохраняется.
+    Прокручивает страницу так, чтобы шапка и баннер ушли за верх
+    вьюпорта. Ориентируется на заголовок h1
+    "Информация об организации, осуществляющей управление МКД".
+    Баннер НЕ удаляется из DOM — в Description его текст сохраняется.
     """
     try:
         scrolled = driver.execute_script("""
+            // 1. Ищем сам заголовок h1
+            var el = document.querySelector('h1._margin-0._top.ng-binding');
+            
+            // Если вдруг классы поменялись, ищем по тексту среди всех h1
+            if (!el) {
+                var h1s = document.querySelectorAll('h1');
+                for (var i = 0; i < h1s.length; i++) {
+                    if ((h1s[i].innerText || '').indexOf('Информация об организации') >= 0) {
+                        el = h1s[i];
+                        break;
+                    }
+                }
+            }
+
+            // 2. Если нашли, вычисляем точную позицию и скроллим с отступом
+            if (el) {
+                var rect = el.getBoundingClientRect();
+                var y = rect.top + window.scrollY;
+                // Отнимаем 20px, чтобы заголовок не прилипал к самому верху
+                window.scrollTo(0, Math.max(0, y - 20));
+                return y;
+            }
+
+            // 3. Фоллбэк: ищем хлебные крошки (как было раньше)
+            var targetText = "Информация об организации, осуществляющей управление";
+            var spans = document.querySelectorAll('.breadcrumb-base span, span.ng-binding');
+            for (var i = 0; i < spans.length; i++) {
+                if ((spans[i].innerText || '').indexOf(targetText) >= 0) {
+                    el = spans[i];
+                    var rect = el.getBoundingClientRect();
+                    var y = rect.top + window.scrollY;
+                    window.scrollTo(0, Math.max(0, y - 40));
+                    return y;
+                }
+            }
+
+            // 4. Последний фоллбэк: ищем сам баннер по тексту
             var texts = ['регламентных работ', 'ограничение доступности',
                          'Внимание! В связи с проведением'];
             var all = document.querySelectorAll('div, section, aside');
@@ -480,12 +522,16 @@ def _scroll_banner_away(driver):
                     }
                 }
             }
-            // Если баннер не найден, принудительно прокручиваем вниз
-            window.scrollBy(0, 200);
-            return 200;
+            return -1;
         """)
-        if scrolled is not None:
+
+        if scrolled is not None and scrolled >= 0:
             log(f"    [scroll] прокрутка выполнена (y={scrolled})")
+            time.sleep(0.6)
+        else:
+            # Крайний случай, если ничего не нашли
+            driver.execute_script("window.scrollTo(0, 500);")
+            log("    [scroll] целевые элементы не найдены — прокрутка 500px")
             time.sleep(0.6)
     except Exception as e:
         log(f"    [scroll] ошибка: {type(e).__name__}: {e}")
@@ -1864,12 +1910,25 @@ def process_one_house(driver, index):
     if index >= len(links):
         return False
 
+    target_link = links[index]
+
+    # --- ПРОВЕРКА НА АВАРИЙНОСТЬ ---
+    try:
+        # Поднимаемся от ссылки вверх до блока карточки дома
+        card_block = target_link.find_element(By.XPATH, "./ancestor::div[contains(@class, 'register-card')]")
+        if "Аварийный" in card_block.text:
+            log(f"    [skip] дом по индексу {index} имеет состояние 'Аварийный' — пропускаем")
+            return True  # Возвращаем True, чтобы цикл перешел к следующему дому
+    except Exception as e:
+        log(f"    [skip] не удалось проверить статус дома {index}: {e} — продолжаем как обычно")
+    # -------------------------------
+
     card_handle = open_new_tab_and_switch(
         driver, wait,
         lambda: driver.execute_script(
             "arguments[0].scrollIntoView({block:'center'}); "
             "arguments[0].click();",
-            links[index]
+            target_link
         )
     )
     time.sleep(2)
@@ -2062,6 +2121,7 @@ def process_one_house(driver, index):
     p7s = None
     zip_file = None
     zip_failed_fallback = False
+    uids_error_detected = False
 
     use_zip = (download_btn is not None and pdf_count == 1)
 
@@ -2096,11 +2156,35 @@ def process_one_house(driver, index):
         log(f"    скачаны пофайлово: {pdf.name!r} + {p7s.name!r}")
 
     else:
+        # Клик по кнопке "Скачать все"
         driver.execute_script("arguments[0].click();", download_btn)
         time.sleep(3)
 
-        zip_file = wait_file(DOWNLOADS,
-                             r"Документы из ГИС ЖКХ.*\.zip", timeout=30)
+        # Проверка на появление вкладки с ошибкой "uids" parameter must be specified
+        try:
+            handles_before = set(driver.window_handles)
+            # Ждем пару секунд, не появилась ли новая вкладка
+            time.sleep(2)
+            new_handles = set(driver.window_handles) - handles_before
+            if new_handles:
+                err_handle = new_handles.pop()
+                driver.switch_to.window(err_handle)
+                time.sleep(1)
+                page_text = driver.execute_script("return document.body.innerText;")
+                if "uids" in page_text and "parameter must be specified" in page_text:
+                    uids_error_detected = True
+                    log("    [zip] ГИС ЖКХ вернул ошибку 'uids parameter must be specified' (битый архив)")
+                    driver.close()
+                    driver.switch_to.window(mgmt_handle) # или gis_handle, смотря откуда кликали
+                    time.sleep(1)
+        except Exception as e:
+            log(f"    [zip] проверка на ошибку uids упала: {e}")
+
+        if uids_error_detected:
+            zip_file = None
+        else:
+            zip_file = wait_file(DOWNLOADS,
+                                 r"Документы из ГИС ЖКХ.*\.zip", timeout=30)
 
         if zip_file is None:
             log("    ZIP не скачался → fallback пофайлово")
@@ -2109,6 +2193,20 @@ def process_one_house(driver, index):
             fb_pair = download_files_individually(driver, wait, pdf_name)
             if fb_pair is None:
                 log("    fallback тоже не сработал — NO_DOWNLOAD_DBL")
+                
+                # Определяем, какой файл битый
+                missing_pdf = "да"
+                missing_p7s = "да"
+                # Попробуем посмотреть, какие файлы есть в Downloads
+                # (если скачался только один, значит другой битый)
+                pdf_files = [f for f in DOWNLOADS.iterdir() if f.is_file() and f.suffix.lower() == ".pdf"]
+                p7s_files = [f for f in DOWNLOADS.iterdir() if f.is_file() and f.suffix.lower() in (".p7s", ".sig")]
+                if len(pdf_files) == 1:
+                    missing_pdf = "нет"
+                if len(p7s_files) == 1:
+                    missing_p7s = "нет"
+                log(f"    [zip] ПОФАЙЛОВОЕ СКАЧИВАНИЕ НЕ УДАЛОСЬ. Битый файл: PDF={missing_pdf}, P7S={missing_p7s}")
+                
                 close_tabs_except(driver, [ufo_handle, gis_handle])
                 driver.switch_to.window(gis_handle)
                 inject_timestamp_overlay(driver)
